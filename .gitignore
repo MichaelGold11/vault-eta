@@ -1,0 +1,5 @@
+.vault-eta/
+node_modules/
+.DS_Store
+*.log
+.claude-plugin/types/

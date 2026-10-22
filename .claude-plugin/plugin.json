@@ -1,0 +1,51 @@
+{
+  "name": "vault-eta",
+  "version": "0.1.0",
+  "description": "Times every step of every Claude Code run, with its agent, model, tokens and cost at API prices, logs one row per turn to .vault-eta/runs/, and shows an ETA learned from past runs in a band above the prompt and a side pane (/eta).",
+  "author": {
+    "name": "Michael Goldberg"
+  },
+  "repository": "https://github.com/MichaelGold11/vault-eta",
+  "license": "MIT",
+  "keywords": [
+    "eta",
+    "cost",
+    "timing",
+    "obsidian",
+    "vault",
+    "second-brain",
+    "usage",
+    "statusline"
+  ],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "cacheWriteTtl": {
+      "type": "string",
+      "title": "Cache write TTL",
+      "description": "Live usage has no 1h/5m split of cache writes, so they are priced at this TTL. 1h (the default) is what interactive sessions use.",
+      "default": "1h",
+      "options": [
+        "1h",
+        "5m"
+      ]
+    },
+    "ignoreSkills": {
+      "type": "string",
+      "title": "Skills that do not name a task",
+      "description": "Comma-separated skills skipped when naming a run's task type. Empty by default: a skill that only hands over to another skill is skipped on its own. Add a skill here when one still names runs it should not.",
+      "default": ""
+    },
+    "reportPath": {
+      "type": "string",
+      "title": "Report file",
+      "description": "Where /eta report writes the note, relative to the folder the logs live under. An absolute path or a path that climbs out with .. is refused. Rewritten whole each time.",
+      "default": "vault-eta-report.md"
+    },
+    "projectsFolder": {
+      "type": "string",
+      "title": "Projects folder",
+      "description": "The vault folder that holds one folder per project, relative to the vault (for example Projects or Work/Projects). Empty detects a top-level folder called projects, in any case, with an optional number prefix (01-Projects, 1 Projects).",
+      "default": ""
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "vault-eta",
+  "owner": {
+    "name": "Michael Goldberg"
+  },
+  "plugins": [
+    {
+      "name": "vault-eta",
+      "source": "./"
+    }
+  ]
+}
