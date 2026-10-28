@@ -61,7 +61,7 @@ describe('the scorecard', () => {
     // the verdict is by interval score, on time and on cost, with both scores and the resample rate
     expect(text).toMatch(/on time, out of sample, by interval score\? \*\*(yes|no|unclear)\*\* \(mean interval score \d+m \d+s against \d+m \d+s, \d+\.\d% (lower|higher), lower in \d+% of 500 resamples; \d+ runs held out\)\./)
     expect(text).toMatch(/on cost, out of sample, by interval score\? \*\*(yes|no|unclear)\*\* \(mean interval score \$[\d.]+ against \$[\d.]+, /)
-    expect(text).toMatch(/Does the slow figure hold as often in every month and on every model\? \*\*(yes|no|unclear)\*\*/)
+    expect(text).toMatch(/Has the slow figure's hit rate shifted between months or between models\? \*\*(yes|no|unclear)\*\*/)
   })
 
   test('a coverage rate carries its Wilson interval; under 30 scored runs it says too few to say', () => {
