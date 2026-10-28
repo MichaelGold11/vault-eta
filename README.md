@@ -162,6 +162,8 @@ It never stores prompt text, file contents, tool output, error messages or subag
 
 Dollars are "at API prices": what the same tokens would cost on the Anthropic API at list prices, not what a subscription bills you. The price table is in `lib/price.mjs`. A model that is not in the table is never guessed: a cost with nothing priced shows `--`, and a total that leaves some unpriced work out shows `+` (`$0.81+`), in the band, the pane, the job toast and the report. Cache writes are priced at the TTL you choose in the options, since live usage does not say which one was used.
 
+
+**How close it is to `/cost`.** The cost shown is the sum of the turns the mod saw: the main loop and every subagent. Token counts match Claude Code's own request by request. Two things keep the sum from equalling `/cost`. First, `/cost` also counts Claude Code's own background requests (the auto-mode check, memory extraction, summaries, web searches), which belong to no turn: about 13% to 29% of `/cost` in long sessions with many subagents. Second, the live feed does not say whether a cache write was the 5-minute or the 1-hour kind, so the mod prices every live write at the 1-hour rate; subagents in practice write 5-minute caches, so subagent cost runs high. In one person's logs, short sessions (under $10) landed within 5% of `/cost` about three times in four, and long ones with subagents landed at 80% to 98% of it. Treat the dollars as an honest estimate of the turns, not as the bill. The session row's `engineUsd` is the exact `/cost` total, next to `loggedUsd`, the figure the band and report add up.
 ## Overhead
 
 - Model tokens: zero. The mod never calls a model and adds nothing to your prompts.
