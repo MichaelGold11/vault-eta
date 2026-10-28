@@ -18,12 +18,15 @@ When idle it shows the last run against its estimate and today's total:
 last wrap 3:40 (est 3-5m, on time) · today $38
 ```
 
-The countdown turns yellow when the run passes the usual time and red when it passes the slow time. It pauses and says `waiting on you` while Claude waits for your answer or a permission. In the first runs it says `learning (3 of 5)` instead of guessing. The band is drawn under any band another plugin draws, never in its place.
+The time is the run's: from your prompt until Claude and every subagent it started are done, background subagents included and parallel ones counted once, with the time Claude waits on you or the machine sleeps left out. When Claude hands work to a background subagent and stops, the band stays on the run and its clock keeps going until the subagent is back; a stretch where nothing works (a background command running on its own) is not counted. The `last` figure after the run is the same clock, so it matches what the band showed at the end.
 
-The band in its states (working, waiting on you, learning, past the usual estimate, idle):
+The countdown turns yellow when the run passes the usual time and red when it passes the slow time. It pauses and says `waiting on you` while Claude waits for your answer or a permission. In the first runs it says `learning (3 of 5)` instead of guessing. When Claude hands work to subagents in its first two requests, the band adds `subagents, usually longer` and the estimate is matched at once to past runs that did the same, when there are enough of them. The band is drawn under any band another plugin draws, never in its place.
+
+The band in its states (working, handing work to subagents, waiting on you, learning, past the usual estimate, idle):
 
 ```
 ~4m left · 2:10 in · $0.81 · website-work
+~4m left · 2:10 in · $0.81 · freeform · subagents, usually longer
 waiting on you · 2:10 in · $0.81 · website-work
 learning (3 of 5) · 2:10 in · $0.81 · website-work
 over usual · 6:40 in · $0.81 · website-work
@@ -102,13 +105,15 @@ node scripts/backfill.mjs --vault ~/notes --machine laptop
 
 Windows paths such as `C:\Users\you\notes` are handled by the same rules (every character that is not a letter or digit becomes a dash in the transcripts folder name). That path handling was written from how Claude Code names those folders and covered by tests, but I could only run it on macOS.
 
+The import writes one row per prompt for the main agent and one per subagent, not one per turn, so an imported run is timed from its timestamps: a stretch of over 10 minutes with no model request or tool call in flight (Claude waiting for a background subagent, a subagent resumed later) is not counted.
+
 Run it again any time: it replaces its own `backfill-YYYY-MM.jsonl` and `.partN` files (nothing else in the folder) and skips runs the live mod already logged. It stores the same fields as the live log (below). It writes and deletes nothing when `.vault-eta`, `runs`, the machine folder, the ignore file or one of its files is a symbolic link, or when a path would land outside the vault.
 
 ## How it learns
 
 Plain statistics on local logs. No model is called.
 
-1. Every run is logged: its task type, project, model, how long the agent worked, the cost and the steps taken.
+1. Every run is logged: its task type, project, model, how long it ran (Claude and its subagents on the band's clock), the cost and the steps taken.
 2. A new run is matched with past runs of the same task type, project and model (falling back to fewer of those when there are too few). Under five matches it says `learning`.
 3. At submit it shows the median ("usual") and the 80th percentile ("slow") of the last 50 matches.
 4. As the run goes it re-estimates: of past runs like this one that were still going at this point, how much longer did they take? It also uses steps done, the agent's task list when it writes one, and the model's speed today.

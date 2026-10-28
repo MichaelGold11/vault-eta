@@ -3,8 +3,9 @@ import { clock, cost, left, range, rough, tokens } from './fmt'
 
 // The band's segments and the pane's lines, as plain data: no engine calls,
 // so they are tested whole and the layout check prints them at any width.
-// The band: `~4m left · 2:10 in · $0.81 · website-work` while a run works,
-// `last wrap 3:40 (est 3-5m, on time) · today $38` when idle, segments
+// The band: `~4m left · 2:10 in · $0.81 · website-work` while a run works
+// (ending ` · subagents, usually longer` once it hands work to subagents in its
+// first requests), `last wrap 3:40 (est 3-5m, on time) · today $38` when idle, segments
 // dropped by priority on a narrow terminal. The pane: header, progress, time
 // left, confidence, NOW, WHO, the time split, speed, context, cost.
 
@@ -51,6 +52,8 @@ export function bandSegments(view: EtaView): Segment[] {
       seg('in', 80, [p(clock(view.elapsedMs)), p(' in', 'dim')], [p(clock(view.elapsedMs))]),
       seg('cost', 60, [p(cost(view.cost))]),
       seg('task', 40, [p(view.taskType)], [p(cut(view.taskType, 14))]),
+      // work handed to subagents early: the estimate is matched to such runs, and the hint is the first to give way
+      ...(view.shape === 'agents' ? [seg('agents', 30, [p('subagents, usually longer', 'dim')], [p('subagents', 'dim')])] : []),
     ]
   }
   const out: Segment[] = []
@@ -62,6 +65,8 @@ export function bandSegments(view: EtaView): Segment[] {
       tail.push(p(` (est ${range(last.est.usualMs, last.est.slowMs)}, `, 'dim'), p(last.verdict, last.verdict === 'on time' ? 'good' : 'warn'), p(')', 'dim'))
     } else if (last.learning) tail.push(p(` (learning ${last.learning.have} of ${last.learning.need})`, 'dim'))
     out.push(seg('last', 90, [...head, ...tail], [p('last ', 'dim'), p(`${cut(last.taskType, 14)} `), p(clock(last.agentMs))]))
+  } else if (view.canImport) {
+    out.push(seg('last', 90, [p('vault-eta: no runs yet. /eta backfill imports your Claude Code history', 'dim')], [p('no runs yet · /eta backfill', 'dim')]))
   } else out.push(seg('last', 90, [p('vault-eta: no runs logged yet', 'dim')], [p('no runs yet', 'dim')]))
   out.push(seg('today', 50, [p('today ', 'dim'), p(cost(view.today.cost, true))]))
   return out
@@ -197,7 +202,7 @@ export function paneLines(view: EtaView, columns: number): Line[] {
     else line.push(p(' · no estimate', 'dim'))
     lines.push(line)
     if (last.cost.priced > 0) lines.push([p('          '), p(cost(last.cost)), p(' at API prices', 'dim')])
-  } else lines.push([p('no runs logged yet', 'dim')])
+  } else lines.push([p('no runs logged yet', 'dim')], ...(view.canImport ? [[p('/eta backfill', 'normal'), p('  imports your Claude Code history', 'dim')]] : []))
   lines.push([])
   const t = view.today
   lines.push([p('today     ', 'dim'), p(`${t.runs} run${t.runs === 1 ? '' : 's'}`), p(' · ', 'dim'), p(clock(t.ms)), p(' · ', 'dim'), p(cost(t.cost, true))])

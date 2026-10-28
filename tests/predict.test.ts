@@ -121,14 +121,16 @@ describe('the profile', () => {
     expect(Math.abs(p.modelShare - 0.7)).toBeLessThan(1e-9)
   })
 
-  test('run time is the main row agentMs (not the span across rows); cost sums every row, a background subagent included', () => {
-    const main = { ...row({ runId: 'x', seconds: 40, src: 'backfill' }), end: T0 - DAY + 3_600_000, agentMs: 40_000, ms: 40_000, usd: 0.5 }
-    const subagent = { ...row({ runId: 'x', seconds: 900, src: 'backfill' }), turnId: 'sub', agentId: 'a1', agentType: 'worker-sonnet', background: true as const, usd: 0.25 }
+  test('run time counts a background subagent: the clock any loop worked, the same as the band; cost sums every row', () => {
+    // a live main turn of 40 s hands work to a background agent of 900 s, and a notification turn of 20 s follows it
+    const main = { ...row({ runId: 'x', seconds: 40 }), usd: 0.5 }
+    const subagent = { ...row({ runId: 'x', seconds: 900, start: T0 - DAY + 30_000 }), turnId: 'sub', agentId: 'a1', agentType: 'worker-sonnet', background: true as const, usd: 0.25 }
+    const notice = { ...row({ runId: 'x', seconds: 20, start: T0 - DAY + 930_000 }), turnId: 'n1', usd: 0.1 }
     const p = new Profile()
-    p.load([main, subagent], 'other')
+    p.load([main, subagent, notice], 'other')
     const x = p.history.find(r => r.runId === 'x')
-    expect(x?.agentMs).toBe(40_000)
-    expect(Math.abs((x?.usd ?? 0) - 0.75) < 1e-9).toBe(true)
+    expect(x?.agentMs).toBe(950_000)
+    expect(Math.abs((x?.usd ?? 0) - 0.85) < 1e-9).toBe(true)
   })
 
   test("this session's rows are its own runs, rebuilt as rows arrive", () => {

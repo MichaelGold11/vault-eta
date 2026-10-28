@@ -11,6 +11,7 @@
 //
 // Never kept: prompt text, file contents, tool output, full Bash commands.
 
+import { groupByRun } from '../lib/aggregate.mjs'
 import { classifyRun, commandHead, folderOf, linesChanged, normalizePath, relativePath, toolPath, EDIT_TOOLS } from '../lib/classify.mjs'
 import { costOf, tokensOf } from '../lib/price.mjs'
 import { clip, lengthOf, union as unionSpans } from '../lib/spans.mjs'
@@ -537,12 +538,10 @@ export function summarize(res, opts) {
   out.push('by model (rows, hours, usd at API prices):')
   for (const [k, m] of [...byModel].sort((a, b) => b[1].usd - a[1].usd)) out.push(`  ${k}: ${m.rows} rows, ${(m.ms / 3.6e6).toFixed(2)} h, $${m.usd.toFixed(2)}${m.unpriced ? ` (${m.unpriced} unpriced)` : ''}`)
   out.push(`total usd $${kept.reduce((/** @type {number} */ a, /** @type {any} */ r) => a + (r.usd ?? 0), 0).toFixed(2)}`)
+  // run time as the report and the estimate count it: the main loop and its subagents on one clock
   const byType = new Map()
-  for (const r of mainRows) {
-    const k = r.task.taskType
-    byType.set(k, [...(byType.get(k) ?? []), r.ms])
-  }
-  out.push('top task types (runs, median seconds):')
+  for (const r of groupByRun(kept)) byType.set(r.taskType, [...(byType.get(r.taskType) ?? []), r.agentMs])
+  out.push('top task types (runs, median run time in seconds):')
   for (const [k, v] of [...byType].sort((a, b) => b[1].length - a[1].length).slice(0, 10)) out.push(`  ${k}: ${v.length}, ${((median(v) ?? 0) / 1000).toFixed(0)} s`)
   out.push(opts.dryRun ? 'dry run: nothing written' : `wrote ${res.byMonth.size} file(s) for machine ${opts.machine}`)
   return out.join('\n')
@@ -553,7 +552,7 @@ export function summarize(res, opts) {
  * The disk writeOut works on: the write rule's view (lstat, realPath; see
  * lib/safepath.mjs) and the operations themselves. scripts/backfill.mjs hands
  * in node:fs, the tests a disk in memory.
- * @typedef {import('../lib/safepath.mjs').PathIo & { join: (...parts: string[]) => string, mkdir: (dir: string) => void, list: (dir: string) => string[], remove: (file: string) => void, write: (file: string, text: string) => void }} Disk
+ * @typedef {import('../lib/safepath.mjs').PathIo & { join: (...parts: string[]) => string, mkdir: (dir: string) => void | Promise<void>, list: (dir: string) => string[] | Promise<string[]>, remove: (file: string) => void | Promise<void>, write: (file: string, text: string) => void | Promise<void> }} Disk
  */
 
 const BACKFILL_ROLL_BYTES = 3.5 * 1024 * 1024
@@ -591,7 +590,7 @@ export async function writeOut(opts, res, disk) {
   await check(disk, vault, disk.join(outDir, 'backfill-check.jsonl'))
   await check(disk, vault, gitignore)
   /** @type {string[]} */
-  const old = (await disk.lstat(outDir)) === null ? [] : disk.list(outDir).filter(f => BACKFILL_FILE.test(f))
+  const old = (await disk.lstat(outDir)) === null ? [] : (await disk.list(outDir)).filter(f => BACKFILL_FILE.test(f))
   for (const f of old) await check(disk, vault, disk.join(outDir, f))
   /** @type {Array<[string, string]>} */
   const files = []
@@ -613,11 +612,11 @@ export async function writeOut(opts, res, disk) {
   }
   // every file this run writes, before anything changes
   for (const [file] of files) await check(disk, vault, file)
-  disk.mkdir(outDir)
-  if ((await disk.lstat(gitignore)) === null) disk.write(gitignore, '*\n')
-  for (const f of old) disk.remove(disk.join(outDir, f))
+  await disk.mkdir(outDir)
+  if ((await disk.lstat(gitignore)) === null) await disk.write(gitignore, '*\n')
+  for (const f of old) await disk.remove(disk.join(outDir, f))
   for (const [file, text] of files) {
     await check(disk, vault, file)
-    disk.write(file, text)
+    await disk.write(file, text)
   }
 }

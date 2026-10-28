@@ -3,9 +3,10 @@ import type { EngineInterface, Register, Timer, TurnStepResult } from 'claude-co
 
 import { resolveBase } from '../lib/base.mjs'
 import { isPersonPrompt, parseList } from '../lib/classify.mjs'
+import { canImport, projectsRoot } from '../lib/coldstart.mjs'
 import type { EtaView } from '../types'
 import { registerBand } from './band'
-import { JOB_KEY, jobCommand, jobName, reportCommand } from './commands'
+import { JOB_KEY, backfillCommand, fsOf, jobCommand, jobName, reportCommand, scorecardCommand } from './commands'
 import { refusalOf } from './guard'
 import { LOG_ROOT, SessionLog, WriteRefused, ensureGitignore, flushLog, joinPath, loadRecent, localDate, reloadLog } from './log'
 import { autoOpen, paneCommand, registerCommand, registerPane } from './pane'
@@ -48,6 +49,10 @@ let cwd = ''
 let machineId = ''
 let version: string | null = null
 let reportPath = 'vault-eta-report.md'
+let ignoreSkills: string[] = []
+let projectsFolder = ''
+/** True while the log has no runs and Claude Code kept transcripts for this folder: the band says how to import them. */
+let importable = false
 let timer: Timer | undefined
 let isTicking = false
 let profile = new Profile()
@@ -83,13 +88,17 @@ function stopTicker() {
   rec.stopTicking()
 }
 
-/** The view the band and the pane draw: the running run's estimate, else the idle summary. */
+/**
+ * The view the band and the pane draw: the running run's estimate while any
+ * of its loops works (its subagents' time is run time, so the clock goes on
+ * after the main loop hands work to a background agent), else the idle summary.
+ */
 async function refreshOnce($: Engine, gen: number) {
   const now = await $.clock.now()
   if (gen !== generation) return
   const live = rec.liveView(now)
   let view: EtaView
-  if (live && live.isMainOpen) {
+  if (live && live.isWorking) {
     const est = estimateRun(profile, live)
     if (live.mainSteps <= 2) rec.setEstimate(live.runId, storedEta(est, live.mainSteps))
     if (est.leftMs !== null && est.leftSlowMs !== null && checkpointed.get(live.runId) !== live.mainSteps) {
@@ -99,10 +108,10 @@ async function refreshOnce($: Engine, gen: number) {
     const usage = await $.session.usage().catch(() => undefined)
     view = workingView(live, est, { contextTokens: usage?.context.tokens ?? null })
   } else {
-    // Nothing runs on the main loop: the self-score catches up with the rows that came in.
+    // Nothing of the run works: the self-score catches up with the rows that came in.
     profile.refreshScores()
     const job = jobName(await $.store.get(JOB_KEY).catch(() => undefined))
-    view = idleView(profile, now, job)
+    view = idleView(profile, now, job, importable)
   }
   if (gen !== generation) return
   const text = JSON.stringify(view)
@@ -141,12 +150,18 @@ function refreshView($: Engine): Promise<void> {
   return mine
 }
 
+/** The process environment, for the folders the mod reads (the backfill's transcripts). */
+function envOf(): { CLAUDE_CONFIG_DIR?: string; HOME?: string; USERPROFILE?: string } {
+  return (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {}
+}
+
 /** The last 90 days of rows, backfill included, as the profile estimates learn from; scored here, before the first run. */
 async function loadProfile($: Engine) {
   const next = new Profile()
   // a log folder that leads elsewhere is not read either
   if (logBlocked !== null) {
     profile = next
+    importable = false
     return
   }
   try {
@@ -156,6 +171,8 @@ async function loadProfile($: Engine) {
     // an empty profile: every run shows learning until its kind has five runs
   }
   profile = next
+  // the hint is only for a log with no runs; one look at session start and after an import
+  importable = next.history.length + next.session.length === 0 && (await canImport(fsOf($), cwd, projectsRoot(envOf())).catch(() => false))
 }
 
 async function onTick($: Engine, gen: number) {
@@ -338,6 +355,9 @@ export const register: Register = (on, options) => {
       viewport = { columns, isFullscreen }
     },
   })
+  ignoreSkills = parseList(typeof options.ignoreSkills === 'string' ? options.ignoreSkills : '')
+  projectsFolder = typeof options.projectsFolder === 'string' ? options.projectsFolder.trim() : ''
+  importable = false
   reportPath = typeof options.reportPath === 'string' && options.reportPath.trim() !== '' ? options.reportPath.trim() : 'vault-eta-report.md'
   registerPane(on)
 
@@ -347,6 +367,17 @@ export const register: Register = (on, options) => {
       const words = (e.args ?? '').trim().split(/\s+/).filter(Boolean)
       const verb = words[0]?.toLowerCase() ?? ''
       if (verb === 'report') await report($)
+      else if (verb === 'scorecard') {
+        if (logBlocked !== null) $.ui.toast(`/eta scorecard not written: ${logBlocked}`, { timeoutMs: 6000 })
+        else await scorecardCommand($, cwd, profile)
+      }
+      else if (verb === 'backfill') {
+        const done = await backfillCommand($, { cwd, machine: machineId, root: projectsRoot(envOf()), ignore: ignoreSkills, projectsFolder, blocked: logBlocked })
+        if (done) {
+          await loadProfile($)
+          void refreshView($)
+        }
+      }
       else if (verb === 'job') {
         if (await jobCommand($, profile, words.slice(1).join(' '))) void refreshView($)
       } else await paneCommand($, verb)

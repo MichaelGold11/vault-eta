@@ -52,15 +52,17 @@ export type EtaWorking = {
   state: EtaState
   isWaiting: boolean
   learning: { have: number; need: number } | null
-  /** Agent time so far: the wall clock less waits on the person and machine sleep. */
+  /** Run time so far, the clock the log keeps: the time the main loop or any of its subagents worked, less waits on the person and machine sleep. */
   elapsedMs: number
-  /** The expected remaining agent time, usual and slow; null once past every past run. */
+  /** The expected remaining run time, usual and slow; null once past every past run. */
   leftMs: number | null
   leftSlowMs: number | null
   /** The expected whole run (elapsed plus left), else the usual figure. */
   totalMs: number | null
   /** The estimate at submit, as stored on the run's rows. */
   submit: EtaEstimateRange | null
+  /** What the run did in its first requests, once known; `agents` (work handed to subagents) adds the band's hint. */
+  shape: string | null
   /** Past runs matched, and how often runs of this kind finished under the slow figure. */
   n: number
   onTimePct: number | null
@@ -93,6 +95,8 @@ export type EtaIdle = {
   job: (EtaTotals & { name: string }) | null
   /** Past runs the profile learned from (90 days, backfill included). */
   learnedRuns: number
+  /** True while the log has no runs and Claude Code kept transcripts for this folder: the band says how to import them. */
+  canImport?: boolean
 }
 
 export type EtaView = { kind: 'none' } | EtaWorking | EtaIdle

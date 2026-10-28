@@ -438,6 +438,75 @@ describe('the band', () => {
     expect(await band($, { hasSurvey: true })).toBe('ctx 41% │ cache 60m │ $18.42')
   })
 
+  test('an Agent call in the first requests: the band says subagents, usually longer, and the estimate matches past agent runs at once', async ($, on) => {
+    const world = newWorld()
+    // twelve freeform runs that answered in 30 s, twelve that handed work to a subagent in their first request and took 300 s
+    const steps = [0, 1000, 2000, 3000].map(at => ({ at, ms: 500, firstTokenMs: null, tokensPerSec: 100, tokens: null, usd: null, stop: 'tool_use' }))
+    const past = Array.from({ length: 24 }, (_, i) => {
+      const isAgents = i % 2 === 1
+      const r = pastRow(i, 'freeform', isAgents ? 300 : 30, 'live')
+      return JSON.stringify({ ...r, steps, tools: isAgents ? [{ at: 500, name: 'Agent', ms: 1000, agentType: 'worker-sonnet' }] : [] })
+    })
+    world.files.set(`${DIR}/2026-10-16-old.jsonl`, `${past.join('\n')}\n`)
+    engine(on, world)
+    await start($)
+    await prompt($, world, 'look into this', 'p1')
+    await $.turn.start({ text: 'look into this', turnId: 'm1' } as never)
+    await step($, 'm1', 0)
+    const before = await band($)
+    expect(before).toMatch(/^~\dm left · 0:01 in · <\$0\.01 · freeform$/)
+    await $.tool.call({ tool: 'Agent', subagent_type: 'worker-sonnet', description: 'sonnet', prompt: 'x', tool_use_id: 'a1' } as never)
+    expect(await band($)).toMatch(/^~\dm left · 0:01 in · <\$0\.01 · freeform · subagents, usually longer$/)
+    const hint = texts(await bandTree($)).at(-1)
+    expect(hint).toMatchObject({ text: 'subagents, usually longer', props: { dimColor: true } })
+    await complete($, world, 'm1', T0)
+    // the estimate kept on the row is the agent runs' own: 300 s usual, not the 165 s of all freeform runs
+    const [row] = rowsOf(world)
+    expect(row?.eta).toMatchObject({ taskType: 'freeform', level: 'type+shape+model', n: 12, usualMs: 300_000 })
+  })
+
+  test('a background agent: the band keeps counting while it works alone, and the time it shows is the time the log keeps', async ($, on) => {
+    const world = newWorld()
+    seedHistory(world)
+    engine(on, world)
+    await start($)
+    const inOf = (text: string) => /(\d+:\d\d) in/.exec(text)?.[1] ?? null
+    // the main turn: a request, an Agent call that comes back at once with its agent in the background, done at 20 s
+    await prompt($, world, 'research this', 'p1')
+    await $.turn.start({ text: 'research this', turnId: 'm1' } as never)
+    await step($, 'm1', 0)
+    await $.agent.spawn({ prompt: 'dig', description: 'sonnet', subagentType: 'worker-sonnet', background: true, tool_use_id: 'a1' } as never)
+    await $.tool.call({ tool: 'Agent', subagent_type: 'worker-sonnet', run_in_background: true, prompt: 'dig', tool_use_id: 'a1' } as never)
+    const agentAt = world.now
+    await $.turn.start({ text: 'dig', turnId: 'x1', agentId: 'agent-sonnet' } as never)
+    await advance(world, 17_900)
+    await step($, 'm1', 1)
+    await complete($, world, 'm1', T0)
+    expect(inOf(await band($))).toBe('0:20')
+
+    // the main loop is done; the agent works for 580 s: the band stays on the run and its clock goes on
+    await advance(world, 300_000)
+    expect(inOf(await band($))).toBe('5:20')
+    await advance(world, agentAt + 579_000 - world.now)
+    await step($, 'x1', 0, SONNET, 'agent-sonnet')
+    await complete($, world, 'x1', agentAt, 'agent-sonnet')
+    expect(world.now - agentAt).toBe(580_000)
+
+    // the notification turn: 10 s
+    await $.prompt.submit({ text: '<task-notification>\n<task-id>agent-sonnet</task-id>\n</task-notification>', wait: false, origin: { kind: 'task-notification' } } as never)
+    const t2 = world.now
+    await $.turn.start({ text: '<task-notification>', turnId: 'm2' } as never)
+    await advance(world, 9000)
+    await step($, 'm2', 0)
+    const working = await band($)
+    await complete($, world, 'm2', t2)
+    const idle = await band($)
+    // the agent's 580 s from 1.1 s cover the main turn's last 18.9 s, then the notification's 10 s: 9:51, on the band and in the log alike
+    expect(inOf(working)).toBe('9:51')
+    expect(idle).toMatch(/^last freeform 9:51 /)
+    expect(new Set(rowsOf(world).map(r => r.runId))).toEqual(new Set(['p1']))
+  })
+
   test('a narrow terminal drops the task, then the cost, then the elapsed time', async ($, on) => {
     const world = newWorld()
     seedHistory(world)
@@ -475,7 +544,7 @@ describe('the pane', () => {
     expect(world.closed).toEqual([PANE, PANE])
 
     expect((await eta($, 'bogus')).text).toBeUndefined()
-    expect(world.toasts.at(-1)).toMatch(/^\/eta: open, close, report, job <name>, job end\.$/)
+    expect(world.toasts.at(-1)).toMatch(/^\/eta: open, close, report, scorecard, backfill, job <name>, job end\.$/)
   })
 
   test('/eta job: set (sanitized), show, end with the totals; nothing reaches the model', async ($, on) => {

@@ -86,7 +86,7 @@ export function registerPane(on: On) {
  */
 export async function paneCommand($: Engine, verb: string) {
   if (verb !== '' && verb !== 'open' && verb !== 'close') {
-    $.ui.toast('/eta: open, close, report, job <name>, job end.', { timeoutMs: 6000 })
+    $.ui.toast('/eta: open, close, report, scorecard, backfill, job <name>, job end.', { timeoutMs: 6000 })
     return
   }
   const pane = (await $.ui.panes()).find(one => one.id === PANE)

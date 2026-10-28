@@ -54,7 +54,7 @@ function fixture() {
     const start = i === 0 ? T0 - 40 * DAY : i === 1 ? T0 - 20 * DAY : T0 - 5 * DAY + i * HOUR
     // one tool on run 2: a Bash call of 4 s (6 s with a wait of 2 s in front)
     const tools = i === 2 ? [{ at: 0, name: 'Bash', cmd: 'bun run', ms: 6000, runMs: 4000, waitMs: 2000 }, { at: 7000, name: 'Edit', ms: 1000 }] : []
-    return row(`w${i}`, start, s, {}, { tools, ...(i === 2 ? { toolMs: 7000, waitMs: 2000 } : {}) })
+    return row(`w${i}`, start, s, {}, { tools, ...(i === 2 ? { toolMs: 7000, waitMs: 2000, agentMs: 98_000 } : {}) })
   })
   // a subagent turn on the last wrap run, 20 s and 50 cents
   rows.push(row('w10', T0 - 5 * DAY + 10 * HOUR, 20, {}, { turnId: 'sub1', agentId: 'a1', agentType: 'worker-sonnet', model: SONNET, usd: 0.5 }))
@@ -91,15 +91,16 @@ describe('the report', () => {
   })
 
   test('every section is there', () => {
-    for (const h of ['## Totals', '## By task type', '## By shape', '## By model', '## By project', '## By job', '## Who did the work', '## Where the time went', '## Accuracy per task type', '## How to read this']) {
+    for (const h of ['## Totals', '## By task type', '## By shape', '## By model', '## By project', '## By job', '## Who did the work', '## Where the time went', '## Accuracy per task type', '## Versus naive baselines', '## Conformal slow figure', '## Drift', '## Cost accuracy', '## How to read this']) {
       expect(text).toContain(h)
     }
   })
 
   test('totals by window', () => {
-    has('| Last 7 days | 11 | 23m 40s | $9.90 |')
-    has('| Last 30 days | 12 | 25m 20s | $10.90 |')
-    has('| All time | 13 | 27m 00s | $11.90 |')
+    // run time from the rows: run 2's 2 s wait on you is not run time, and the subagent's 20 s ran inside its main turn
+    has('| Last 7 days | 11 | 23m 38s | $9.90 |')
+    has('| Last 30 days | 12 | 25m 18s | $10.90 |')
+    has('| All time | 13 | 26m 58s | $11.90 |')
   })
 
   test('by task type: usual is the median, slow the 80th percentile, costs include subagents', () => {
@@ -108,14 +109,14 @@ describe('the report', () => {
   })
 
   test('by model, project and job', () => {
-    has('| claude-opus-5-5 | 13 | 27m 00s | $11.90 |')
-    has('| website | 11 | 25m 00s | $11.50 |')
+    has('| claude-opus-5-5 | 13 | 26m 58s | $11.90 |')
+    has('| website | 11 | 24m 58s | $11.50 |')
     has('| (none) | 2 | 2m 00s | $0.400 |')
     has(`| launch | 1 | 1m 30s | $0.300 | ${localDate(T0 - DAY)} | ${localDate(T0 - DAY)} |`)
   })
 
   test('who did the work: the main thread against each subagent type and model', () => {
-    has('| main thread (opus) | 13 | 27m 00s | $11.40 |')
+    has('| main thread (opus) | 13 | 26m 58s | $11.40 |')
     has('| worker-sonnet (sonnet) | 1 | 20s | $0.500 |')
   })
 
@@ -127,17 +128,106 @@ describe('the report', () => {
     has('| Edit | 1 | 1s | 1s |')
   })
 
+  test('where the time went splits the run time: the main loop working, then subagents alone; a row that cannot be placed is counted', () => {
+    // one run: a 60 s main turn (20 s of it a Bash call) hands work to a background agent of 300 s from 30 s; a 10 s notification turn at 340 s
+    const runRows = [
+      row('a1', T0 - HOUR, 60, {}, { toolMs: 20_000, tools: [{ at: 5000, name: 'Bash', cmd: 'bun test', ms: 20_000 }] }),
+      row('a1', T0 - HOUR + 30_000, 300, {}, { turnId: 'sub', agentId: 'x1', agentType: 'worker-sonnet', model: SONNET, background: true }),
+      row('a1', T0 - HOUR + 340_000, 10, {}, { turnId: 'n1' }),
+    ]
+    const t = buildReport(runRows, { now: T0 })
+    // run time 0 to 330 s and 340 to 350 s: 5m 40s, of which the main loop's 70 s (20 s in tools) and the agent's 270 s alone
+    expect(t).toContain('| All time | 1 | 5m 40s |')
+    expect(t).toContain('| Main loop, the model working | 50s |')
+    expect(t).toContain('| Main loop, tools | 20s |')
+    expect(t).toContain('| Subagents alone | 4m 30s |')
+    expect(t).toContain('Times are run time, the clock the band counts')
+    expect(t).not.toContain('could not be placed')
+    // a live row from before the recorder kept a turn's own start, with a wait that began before its window: counted, its stored time used
+    const cut = row('c1', T0 - 2 * HOUR, 10, {}, { agentMs: 8000, waitMs: 2000, tools: [{ at: 0, name: 'Bash', ms: 100_000, runMs: 2000, waitMs: 98_000, asked: true }] })
+    const withCut = buildReport([...runRows, cut], { now: T0 })
+    expect(withCut).toContain('1 row could not be placed on the clock')
+    expect(withCut).toContain('| All time | 2 | 5m 48s |')
+  })
+
   test('accuracy: six scored runs, four under the slow estimate, a correction of x2', () => {
     // runs 5 to 10 are scored (the first five have no history): 100 s x4 covered, then 200 s and 400 s against a slow of 100 s
-    has('| wrap | 6 | 67% | x1.0 | x2.00 | - |')
+    has('| wrap | 6 | too few to say | x1.0 | x2.00 | - |')
     // freeform has two runs: too few to list
     expect(text.split('\n').filter(l => l.startsWith('| freeform | ')).length).toBe(1)
   })
 
-  test('no em dash, no prompt text, three lines on how to read it', () => {
+  test('no em dash, no prompt text, four lines on how to read it', () => {
     expect(text.includes(String.fromCharCode(0x2014))).toBe(false)
     const tail = text.split('## How to read this')[1]?.trim().split('\n') ?? []
-    expect(tail.length).toBe(3)
+    expect(tail.length).toBe(4)
+  })
+
+  test('the baseline tables compare the matcher with the per-type and global figures on the same runs, held out and in sample', () => {
+    const lines = text.split('\n')
+    // six wrap runs can be compared (the other seven fixture runs have too little behind them): all four predictors are listed in both tables
+    expect(text).toContain("In sample, not the verdict's basis: the same 6 runs, each predicted from only the runs that ended before it started.")
+    expect(text).toContain("Held out, the verdict's basis: the last 30% of the runs by start time (2 runs), each slow figure as it stands:")
+    expect(text).toContain('| Predictor | Finished under slow | Median slow | Mean interval score |')
+    for (const label of ['Matcher (uncorrected)', 'Matcher (corrected)', 'Per-type median and p80', 'Global median and p80']) {
+      expect(lines.filter(l => l.startsWith(`| ${label} | `)).length).toBe(2)
+    }
+    // the matcher and the per-type figure agree on a single type: held out, the same hit rate, slow figure and score;
+    // in sample, the same hit rate, spread, slow figure and miss (only the scaling to matched coverage differs)
+    const cells = (label: string) => lines.filter(l => l.startsWith(`| ${label} | `)).map(l => l.split('|'))
+    const [heldM, inM] = cells('Matcher (uncorrected)')
+    const [heldT, inT] = cells('Per-type median and p80')
+    expect(heldM).toEqual(heldT?.map((c, i) => (i === 1 ? ' Matcher (uncorrected) ' : c)))
+    expect(inM?.slice(2, 6)).toEqual(inT?.slice(2, 6))
+  })
+
+  test('a hit rate carries a Wilson interval, and a small table says too few to say', () => {
+    // the baseline table is not a table of types: six runs, five covered, 83% with an interval around it
+    const line = text.split('\n').find(l => l.startsWith('| Matcher (uncorrected) | ')) ?? ''
+    expect(/\| \d+% \(\d+% to \d+%\) \|/.test(line)).toBe(true)
+    // a table of types under 30 runs gives no rate
+    expect(text).not.toContain('| wrap | 6 | 67%')
+    const many = Array.from({ length: 60 }, (_, i) => row(`m${i}`, T0 - 60 * HOUR + i * HOUR, 100))
+    const big = buildReport(many, { now: T0 })
+    // 54 scored runs, all inside the slow figure: 100% with the interval of 54 out of 54
+    expect(big).toContain('| wrap | 55 | 100% (93% to 100%) |')
+  })
+
+  test('the verdict is computed by interval score, on time and on cost: unclear on a small holdout, and the section says why', () => {
+    // the two held-out runs took 200 s and 400 s against a slow figure of 100 s from both: 100 + 5 x 100 and 100 + 5 x 300, a mean of 18m 20s
+    expect(text).toContain(
+      '**Verdict on time: the matcher beats the per-type median out of sample, by interval score: unclear** (mean interval score 18m 20s against 18m 20s, 0.0% lower; the matcher scored lower in 0% of 500 resamples of the 2 held-out runs, where the two slow figures held 0% and 0% of the time).',
+    )
+    expect(text).toContain('**Verdict on cost: the matcher beats the per-type median out of sample, by interval score: unclear**')
+    expect(text).toContain('Yes or no needs a mean score at least 5% lower that stays lower in at least 90% of the resamples, and at least 100 held-out runs')
+    expect(text).toContain("A run's interval score is its slow figure plus five times any overrun past it")
+  })
+
+  test('conformal calibration is scored against the correction in use, and says it is not used live unless it clears the bar', () => {
+    // two held-out runs are too few to show
+    expect(text).toContain('## Conformal slow figure\n\nFewer than 5 runs are held out yet.')
+    const many = Array.from({ length: 60 }, (_, i) => row(`m${i}`, T0 - 60 * HOUR + i * HOUR, 100))
+    const big = buildReport(many, { now: T0 })
+    expect(big).toContain('Split-conformal calibration of the slow figure against the correction in use, on the same 17 held-out runs.')
+    expect(big).toContain('| Slow figure | Finished under slow (target 80%) | Median slow | Mean interval score |')
+    // steady runs: both hold every time with the same figure, so conformal is no closer to 80% and is not used live
+    expect(big).toContain('| Correction in use | 100% (82% to 100%) | 1m 40s | 1m 40s |')
+    expect(big).toContain('| Conformal, latest 100 | 100% (82% to 100%) | 1m 40s | 1m 40s |')
+    expect(big).toContain('The live estimate keeps the correction in use: conformal did not hold closer to 80% with a median slow figure no wider on these runs, so it stays an evaluated option.')
+  })
+
+  test('drift: coverage by month and by main model, with a plain statement', () => {
+    const lines = text.split('\n')
+    expect(lines.some(l => l.startsWith('| month | '))).toBe(true)
+    expect(lines.some(l => l.startsWith(`| main model | ${OPUS} | `))).toBe(true)
+    // thirteen runs: no month or model is big enough to compare
+    expect(text).toContain('Unclear: fewer than two months or models have 30 scored runs to compare.')
+  })
+
+  test('the cost table scores the same replay on dollars', () => {
+    // each wrap run cost $1 but the last, which cost $1.50 with its subagent: five of six held
+    has('| all types | 6 | too few to say | x1.0 |')
+    has('| wrap | 6 | too few to say | x1.0 |')
   })
 
   test('an empty log still makes a note', () => {

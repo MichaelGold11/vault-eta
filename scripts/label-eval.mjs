@@ -18,6 +18,18 @@
 //           touched so far and, from the third request, the shape; the matches
 //           still going give the time left (history part of the estimate only)
 //
+// A table splits the current setup's submit and step figures by the run's
+// shape (answer, read, shell, edit, agents), with a 95% interval on coverage.
+// The last repeats the step figures on the same rows with the subagent-aware
+// estimate (lib/stats remainingWithAgents) wherever the run had agents going
+// when that request began, and counts those rows.
+//
+// Every time is on the run clock (lib/aggregate runClock), the one the band
+// counts: the main loop and its subagents, background ones included, parallel
+// ones once, waits on the person and sleep left out. The time gone at a step
+// is that clock up to the step's start, from the run's own rows. Rows that
+// cannot be placed on the clock add their stored time; the first line counts them.
+//
 // Typical miss is exp(median |log(actual / usual)|); coverage is the share of
 // runs that finished under the slow figure. Labels are derived from each
 // row's tool calls (names and folders), so a rule can be compared without
@@ -27,7 +39,7 @@ import path from 'node:path'
 import { agentMsBefore, earlyByRun, summarizeRuns } from '../lib/aggregate.mjs'
 import { EDIT_TOOLS, SHAPE_STEPS, classifyRun, parseList, shapeOf } from '../lib/classify.mjs'
 import { modelKey } from '../lib/price.mjs'
-import { LEVELS, replay, replayAtStep, typicalError } from '../lib/stats.mjs'
+import { LEVELS, replay, replayAgentsAtStep, replayAtStep, scoreSteps, typicalError, wilson, withAgents } from '../lib/stats.mjs'
 import { loadAllRows } from './report.mjs'
 import { isMainModule } from './main.mjs'
 
@@ -91,6 +103,8 @@ function replayRuns(usable, early, setup) {
       usd: s.usd,
       endedAt: s.endedAt,
       startedAt: s.startedAt,
+      agents: s.subagents.map(a => ({ type: a.agentType, startedAt: a.startedAt, endedAt: a.endedAt })),
+      mainLastAt: s.mainLastAt,
     }
     return legacy ? { ...run, project: run.project ?? NONE, model: run.model ?? NONE, shape: undefined } : run
   })
@@ -108,19 +122,19 @@ function replayRuns(usable, early, setup) {
     queryOf: r => query(r, { taskType: commandOf(r.runId) ?? 'freeform', project: null, model: r.model === NONE ? null : r.model, effort: r.effort, promptChars: r.promptChars }),
   })
   out.steps = {}
+  out.agentSteps = {}
   for (const k of setup.steps) {
-    out.steps[k] = replayAtStep(runs, {
-      levels,
-      stateOf: r => {
-        const e = early.get(r.runId)
-        const elapsedMs = e ? agentMsBefore(e.facts, k + 1) : null
-        if (!e || elapsedMs === null) return null
-        const l = labelOf(e.facts, e.command, setup, k)
-        const shape = k >= SHAPE_STEPS ? shapeOf(e.facts.calls.filter(c => c.step <= SHAPE_STEPS).map(c => c.name)) : undefined
-        const q = query(r, { taskType: l.taskType, project: l.project, model: r.model === NONE ? null : r.model, effort: r.effort, promptChars: r.promptChars, shape })
-        return { elapsedMs, query: q }
-      },
-    })
+    const stateOf = (/** @type {any} */ r) => {
+      const e = early.get(r.runId)
+      const elapsedMs = e ? agentMsBefore(e.facts, k + 1) : null
+      if (!e || elapsedMs === null) return null
+      const l = labelOf(e.facts, e.command, setup, k)
+      const shape = k >= SHAPE_STEPS ? shapeOf(e.facts.calls.filter(c => c.step <= SHAPE_STEPS).map(c => c.name)) : undefined
+      const q = query(r, { taskType: l.taskType, project: l.project, model: r.model === NONE ? null : r.model, effort: r.effort, promptChars: r.promptChars, shape })
+      return { elapsedMs, at: e.facts.stepStarts[k] ?? 0, query: q }
+    }
+    out.steps[k] = replayAtStep(runs, { levels, stateOf })
+    out.agentSteps[k] = replayAgentsAtStep(runs, { stateOf })
   }
   return { out, byId }
 }
@@ -163,12 +177,38 @@ export function evaluate(rows, options) {
     for (const r of results[name].byId.values()) c.set(r.taskType, (c.get(r.taskType) ?? 0) + 1)
     return [...c].sort((a, b) => b[1] - a[1])
   }
-  return { table: lines.join('\n'), labels: Object.fromEntries(names.map(n => [n, counts(n)])) }
+  // by shape (the run's own, as the report has it), for the current setup
+  const shapeOf_ = new Map(usable.map(r => [r.runId, r.shape ?? 'answer']))
+  const keyOf = (/** @type {{ runId: string }} */ r) => shapeOf_.get(r.runId) ?? 'answer'
+  const states_ = [['submit', results.current.out.submit, 'submit'], ...options.steps.map(k => [`step ${k}`, results.current.out.steps[k], 'step'])]
+  const byState = states_.map(([title, rowsOf, field]) => [title, scoreSteps(rowsOf, keyOf, field)])
+  const shapes = ['answer', 'read', 'shell', 'edit', 'agents']
+  const shapeCell = g => {
+    if (!g || g.scored === 0) return '-'
+    const ci = wilson(g.hits, g.scored)
+    return `${(g.coverage * 100).toFixed(0)}% (${ci ? `${(ci.lo * 100).toFixed(0)} to ${(ci.hi * 100).toFixed(0)}` : '-'}) x${Math.exp(g.error ?? 0).toFixed(2)}, n=${g.scored}${g.scored < 30 ? ' too few to say' : ''}`
+  }
+  const shapeLines = [`shape | ${byState.map(([t]) => `${t}: slow coverage (95% interval) typical miss`).join(' | ')}`, `--- | ${byState.map(() => '---').join(' | ')}`]
+  for (const shape of shapes) shapeLines.push(`${shape} | ${byState.map(([, g]) => shapeCell(g[shape])).join(' | ')}`)
+  // the same step rows with the subagent-aware figure wherever agents were going
+  const agentStates = options.steps.map(k => {
+    const rows = withAgents(results.current.out.steps[k], results.current.out.agentSteps[k])
+    const going = new Map()
+    for (const r of rows) if (r.step && r.going) going.set(keyOf(r), (going.get(keyOf(r)) ?? 0) + 1)
+    return [`step ${k}`, scoreSteps(rows, keyOf, 'step'), going]
+  })
+  const agentLines = [`shape | ${agentStates.map(([t]) => `${t}: slow coverage (95% interval) typical miss, rows with agents going`).join(' | ')}`, `--- | ${agentStates.map(() => '---').join(' | ')}`]
+  for (const shape of shapes) agentLines.push(`${shape} | ${agentStates.map(([, g, going]) => (g[shape] && g[shape].scored > 0 ? `${shapeCell(g[shape])}, ${going.get(shape) ?? 0} going` : '-')).join(' | ')}`)
+  const fellBack = summaries.reduce((s, r) => s + r.fellBack, 0)
+  return { table: lines.join('\n'), shapeTable: shapeLines.join('\n'), agentTable: agentLines.join('\n'), labels: Object.fromEntries(names.map(n => [n, counts(n)])), fellBack }
 }
 
 if (isMainModule(import.meta.url)) {
   const opts = parseArgs(process.argv.slice(2))
-  const { table, labels } = evaluate(loadAllRows(opts.vault), opts)
+  const { table, shapeTable, agentTable, labels, fellBack } = evaluate(loadAllRows(opts.vault), opts)
+  console.log(`Run clock: ${fellBack} row${fellBack === 1 ? '' : 's'} could not be placed and added their stored time.\n`)
   console.log(table)
+  console.log(`\nBy shape (current setup):\n${shapeTable}`)
+  console.log(`\nBy shape, subagent-aware step figure where agents were going (current setup, same rows):\n${agentTable}`)
   for (const name of Object.keys(labels)) console.log(`\n${name} labels: ${labels[name].slice(0, 10).map(([t, n]) => `${t} ${n}`).join(', ')}`)
 }

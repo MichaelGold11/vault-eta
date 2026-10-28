@@ -12,7 +12,7 @@ import {
   toolPath,
 } from '../lib/classify.mjs'
 import { costOf, familyOf, tokensOf } from '../lib/price.mjs'
-import { clip, lengthOf, overlapMs, subtract } from '../lib/spans.mjs'
+import { clip, lengthOf, subtract, union } from '../lib/spans.mjs'
 import type { Span } from '../lib/spans.mjs'
 
 // The recorder: what happened in each run, kept in memory while it runs and
@@ -157,18 +157,18 @@ export type LiveView = {
   isWorking: boolean
   isMainOpen: boolean
   startedAt: number
-  /** Wall time less machine sleep. */
+  /** The time any of the run's loops (main or subagent) was working, machine sleep left out. */
   elapsedMs: number
   /** Time held by the person (a question, a plan, a permission dialog), sleep left out. */
   waitMs: number
-  /** elapsedMs less waitMs: what the estimate compares with past runs. */
+  /** elapsedMs less waitMs: the run clock, the one the log keeps (lib/aggregate runClock) and the estimate compares with past runs. */
   agentMs: number
   /** The main loop's tool time, Agent calls and waits left out. */
   toolMs: number
   /** The run's cost so far, from each model request as it ends. */
   cost: Cost
   mainSteps: number
-  /** What the run did in its first requests (answer, read, shell, edit, agents); null until its third request begins. */
+  /** What the run did in its first requests (answer, read, shell, edit, agents); null until its third request begins, or until an Agent call in them. */
   shape: string | null
   model: string | null
   effort: Effort | null
@@ -199,11 +199,12 @@ export type TurnRow = {
   background: boolean | null
   model: string
   effort: Effort | null
+  /** When the turn began on the clock: its loop opening, or end less ms if that is earlier. */
   start: number
   end: number
-  /** The engine's durationMs: the turn's wall time. */
+  /** The engine's durationMs: the turn's wall time, less any wait on the person the engine leaves out itself, so it can be shorter than end - start. */
   ms: number
-  /** ms less waiting on the person and machine sleep: what the ETA learns. */
+  /** end - start less waiting on the person and machine sleep: this turn's part of the run clock, what the ETA learns. */
   agentMs: number
   modelMs: number
   toolMs: number
@@ -345,6 +346,8 @@ export type Run = {
   effort: Effort | null
   /** Waits on the person in the run's finished turns, clock time. */
   waitSpans: Span[]
+  /** The run's finished turns on the clock (main and subagent), machine sleep cut out, merged. */
+  spans: Span[]
   /** The run's finished turns, one part each. */
   done: WhoPart[]
   /** Tool time of the main loop's finished turns, Agent calls and waits left out. */
@@ -388,6 +391,8 @@ export const WAIT_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode'])
 export const AGENT_TOOLS = new Set(['Agent', 'Task'])
 const SHELL_TOOLS = new Set(['Bash', 'PowerShell'])
 const MAX_WAIT_SPANS = 500
+/** Merged spans a run's clock keeps: a gap where no loop worked starts a new one, so this many is far past any real run. */
+const MAX_SPANS = 500
 const MAX_CHECKPOINTS = 200
 const MAX_DONE = 500
 const MAX_DIRS = 200
@@ -523,6 +528,7 @@ export class Recorder {
       model: null,
       effort: null,
       waitSpans: [],
+      spans: [],
       done: [],
       closedToolMs: 0,
       eta: null,
@@ -911,7 +917,9 @@ export class Recorder {
     this.loops.delete(key)
     const end = input.now
     const duration = Number.isFinite(input.durationMs) && input.durationMs > 0 ? input.durationMs : end - (loop?.startedAt ?? end)
-    const start = end - duration
+    // The engine's duration leaves out a permission prompt or a question it waited on, so the turn began when its loop opened:
+    // the band counts from there, and a window cut at end - duration would leave the wait partly outside it.
+    const start = Math.min(end - duration, loop?.startedAt ?? end)
     const window: Span = [start, end]
     const agent = input.agentId ? this.agents.get(input.agentId) : undefined
     if (agent) agent.isOpen = false
@@ -979,7 +987,7 @@ export class Recorder {
     const stepSpans: Span[] = (loop?.steps ?? []).map(s => [s.startedAt, s.endedAt ?? end])
     const modelMs = lengthOf(subtract(clip(stepSpans, window), this.sleeps))
     const toolMs = lengthOf(subtract(clip(runSpans, window), this.sleeps))
-    const agentMs = Math.max(0, duration - waitMs - sleepMs)
+    const agentMs = Math.max(0, end - start - waitMs - sleepMs)
 
     // What it cost: the engine's turn usage, else the requests' own (an interrupted turn has none).
     const model = input.usage?.model || steps[steps.length - 1]?.model || agent?.model || ''
@@ -1066,8 +1074,10 @@ export class Recorder {
       cond,
     }
 
-    // The run's running totals: its waits, who did what, and the estimate it began with.
+    // The run's running totals: its clock, its waits, who did what, and the estimate it began with.
     if (run) {
+      run.spans = union([...run.spans, ...subtract([window], sleepIn)])
+      if (run.spans.length > MAX_SPANS) run.spans = run.spans.slice(-MAX_SPANS)
       run.waitSpans.push(...clip(waitSpans, window))
       if (run.waitSpans.length > MAX_WAIT_SPANS) run.waitSpans = run.waitSpans.slice(-MAX_WAIT_SPANS)
       const inAgentsMs = tools.filter(t => AGENT_TOOLS.has(t.name) && !t.background).reduce((s, t) => s + Math.max(0, t.ms - (t.waitMs ?? 0)), 0)
@@ -1141,21 +1151,27 @@ export class Recorder {
     return out
   }
 
-  /** Where the run's time went so far: wall less sleep, the person's holds, and the rest. */
-  private runTimes(run: Run, now: number): { end: number; elapsedMs: number; waitMs: number; agentMs: number } {
-    const end = run.isMainOpen ? now : (run.endedAt ?? now)
-    const window: Span = [run.startedAt, end]
-    const sleepMs = overlapMs(this.sleeps, window)
+  /**
+   * Where the run's time went so far, on the run clock the log keeps
+   * (lib/aggregate runClock): the time any of its loops worked (its finished
+   * turns and its open loops up to now, parallel ones once, sleep cut out),
+   * the person's holds in it, and the rest. A gap where no loop worked (a
+   * background command ran, then its notification came) is no one's.
+   */
+  private runTimes(run: Run, now: number): { elapsedMs: number; waitMs: number; agentMs: number } {
+    const loops = this.loopsOf(run)
+    const open: Span[] = loops.map(l => [l.startedAt, now])
+    const worked = union([...run.spans, ...subtract(open, this.sleeps)])
     const held: Span[] = [...run.waitSpans]
-    for (const loop of this.loopsOf(run)) {
+    for (const loop of loops) {
       for (const t of loop.tools) {
-        const span = this.heldSpan(t, end)
+        const span = this.heldSpan(t, now)
         if (span) held.push(span)
       }
     }
-    const waitMs = lengthOf(subtract(clip(held, window), this.sleeps))
-    const elapsedMs = Math.max(0, end - run.startedAt - sleepMs)
-    return { end, elapsedMs, waitMs, agentMs: Math.max(0, elapsedMs - waitMs) }
+    const elapsedMs = lengthOf(worked)
+    const agentMs = lengthOf(subtract(worked, held))
+    return { elapsedMs, waitMs: elapsedMs - agentMs, agentMs }
   }
 
   /** An open loop's share so far, as turnCompleted will count it. */
@@ -1264,7 +1280,8 @@ export class Recorder {
       toolMs: round(toolMs),
       cost: { usd: run.liveUsd, priced: run.pricedSteps, unpriced: run.unpricedSteps },
       mainSteps: run.mainSteps,
-      shape: run.stepsBegun > SHAPE_STEPS ? shapeOf(run.earlyTools) : null,
+      // an Agent call outranks every other tool, so the first one settles the shape before the third request does
+      shape: run.stepsBegun > SHAPE_STEPS ? shapeOf(run.earlyTools) : run.earlyTools.some(t => AGENT_TOOLS.has(t)) ? 'agents' : null,
       model: run.model,
       effort: run.effort,
       promptChars: run.promptChars,

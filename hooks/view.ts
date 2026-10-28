@@ -53,6 +53,7 @@ export function workingView(live: LiveView, est: Estimate, ctx: { contextTokens:
     leftSlowMs: est.leftSlowMs === null ? null : Math.round(est.leftSlowMs),
     totalMs: est.totalMs === null ? null : Math.round(est.totalMs),
     submit: est.submit ? { usualMs: Math.round(est.submit.usualMs), slowMs: Math.round(est.submit.slowMs) } : null,
+    shape: live.shape,
     n: est.n,
     onTimePct: est.coverage === null ? null : Math.round(est.coverage * 100),
     scored: est.scored,
@@ -78,7 +79,7 @@ export function lastRunOf(run: ProfileRun): EtaLastRun {
   }
 }
 
-export function idleView(profile: Profile, now: number, job: string | null): EtaIdle {
+export function idleView(profile: Profile, now: number, job: string | null, canImport = false): EtaIdle {
   const last = profile.lastRun(null)
   const midnight = startOfDay(now)
   return {
@@ -87,5 +88,6 @@ export function idleView(profile: Profile, now: number, job: string | null): Eta
     today: profile.totals(r => r.startedAt >= midnight),
     job: job ? { name: job, ...profile.totals(r => r.job === job) } : null,
     learnedRuns: profile.history.length + profile.session.length,
+    ...(canImport ? { canImport } : {}),
   }
 }

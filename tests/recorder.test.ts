@@ -2,7 +2,9 @@ import type { On } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
-import { groupByRun } from '../lib/aggregate.mjs'
+import { Recorder } from '../hooks/record'
+import type { TurnRow } from '../hooks/record'
+import { groupByRun, summarizeRuns } from '../lib/aggregate.mjs'
 
 // The test's hooks stand for the engine beneath the plugin. The clock is the
 // world's own, moved by the test and by the scripted model and tools, so a
@@ -493,6 +495,74 @@ describe('outcomes and where the time went', () => {
     expect(row?.sleepMs).toBe(599_000)
     expect(row?.sleeps).toEqual([[3000, 599_000]])
     expect(row?.agentMs).toBe(5000)
+  })
+})
+
+describe('the run clock: the band and the log agree', () => {
+  const S = 1000
+  const fresh = () => {
+    const rec = new Recorder({ cacheWriteTtl: '1h', ignoreSkills: [], tickMs: 1000, sleepGapMs: 5000 })
+    rec.startSession({ machineId: 'm1', sessionId: 's1', cwd: '/vault', version: null, now: T0 })
+    return rec
+  }
+
+  test('main 20 s, a background agent 580 s, a notification turn 10 s: the band counts the agent, and the log says the same', () => {
+    const rec = fresh()
+    const rows: TurnRow[] = []
+    rec.promptSubmitted({ origin: 'composer', isMidTurn: false, text: 'research this' })
+    rec.mainTurnStarted({ turnId: 'm1', text: 'research this', now: T0 })
+    const first = rec.beginStep({ turnId: 'm1', index: 0, model: OPUS, now: T0 })
+    rec.endStep(first, { now: T0 + 5 * S, usage: null, stop: 'tool_use' })
+    // the Agent call returns in 2 s with its agent working in the background
+    rec.toolStarted({ id: 'ag', tool: 'Agent', input: { subagent_type: 'worker-sonnet', run_in_background: true }, now: T0 + 5 * S })
+    rec.spawned({ agentId: 'a1', type: 'worker-sonnet', model: HAIKU, background: true })
+    rec.agentTurnStarted({ agentId: 'a1', turnId: 'x1', now: T0 + 6 * S })
+    rec.toolEnded({ id: 'ag', now: T0 + 7 * S, failed: false, backgroundTaskId: 'a1' })
+    const last = rec.beginStep({ turnId: 'm1', index: 1, model: OPUS, now: T0 + 7 * S })
+    rec.endStep(last, { now: T0 + 20 * S, usage: null, stop: 'end_turn' })
+    rows.push(rec.turnCompleted({ turnId: 'm1', durationMs: 20 * S, reason: 'answer', now: T0 + 20 * S }))
+    expect(rows[0]?.agentMs).toBe(20 * S)
+
+    // the main loop is done and the agent works on: the run is still working, its clock still going
+    expect(rec.liveView(T0 + 300 * S)).toMatchObject({ isWorking: true, isMainOpen: false, agentMs: 300 * S })
+    rows.push(rec.turnCompleted({ agentId: 'a1', turnId: 'x1', durationMs: 580 * S, reason: 'answer', now: T0 + 586 * S }))
+    expect(rec.liveView(T0 + 588 * S)).toMatchObject({ isWorking: false, agentMs: 586 * S })
+
+    // the notification turn 2 s later; the 2 s between are no one's
+    rec.promptSubmitted({ origin: 'task-notification', isMidTurn: false, text: '<task-notification>\n<task-id>a1</task-id>\n</task-notification>' })
+    rec.mainTurnStarted({ turnId: 'm2', text: '<task-notification>', now: T0 + 588 * S })
+    expect(rec.liveView(T0 + 593 * S)?.agentMs).toBe(591 * S)
+    rows.push(rec.turnCompleted({ turnId: 'm2', durationMs: 10 * S, reason: 'answer', now: T0 + 598 * S }))
+
+    // 0 to 586 s and 588 to 598 s: what the band shows at the end is what the log keeps
+    const band = rec.liveView(T0 + 598 * S)?.agentMs
+    expect(band).toBe(596 * S)
+    expect(new Set(rows.map(r => r.runId)).size).toBe(1)
+    expect(summarizeRuns(rows as never)[0]).toMatchObject({ agentMs: band, mainMs: 30 * S, fellBack: 0 })
+  })
+
+  test('a turn whose engine time leaves out a permission prompt starts where its loop opened: the wait inside it, both clocks 10 s', () => {
+    const rec = fresh()
+    rec.promptSubmitted({ origin: 'composer', isMidTurn: false, text: 'ship it' })
+    rec.mainTurnStarted({ turnId: 'm1', text: 'ship it', now: T0 })
+    const step1 = rec.beginStep({ turnId: 'm1', index: 0, model: OPUS, now: T0 })
+    rec.endStep(step1, { now: T0 + 2 * S, usage: null, stop: 'tool_use' })
+    // a dialog holds the call 30 s, then it runs 2 s
+    rec.toolStarted({ id: 'b1', tool: 'Bash', input: { command: 'git push' }, now: T0 + 2 * S })
+    rec.checked('b1', 'ask')
+    rec.dialogShown({ tool: 'Bash' })
+    expect(rec.liveView(T0 + 20 * S)).toMatchObject({ isWaitingOnYou: true, agentMs: 2 * S })
+    rec.toolRan('b1', 2 * S)
+    rec.toolEnded({ id: 'b1', now: T0 + 34 * S, failed: false })
+    const step2 = rec.beginStep({ turnId: 'm1', index: 1, model: OPUS, now: T0 + 34 * S })
+    rec.endStep(step2, { now: T0 + 40 * S, usage: null, stop: 'end_turn' })
+    expect(rec.liveView(T0 + 40 * S)?.agentMs).toBe(10 * S)
+    // the engine's turn time is 10 s: it left the 30 s wait out itself
+    const row = rec.turnCompleted({ turnId: 'm1', durationMs: 10 * S, reason: 'answer', now: T0 + 40 * S })
+    expect(row).toMatchObject({ start: T0, end: T0 + 40 * S, ms: 10 * S, waitMs: 30 * S, agentMs: 10 * S })
+    expect(row.tools[0]).toMatchObject({ at: 2 * S, waitMs: 30 * S })
+    expect(rec.liveView(T0 + 40 * S)?.agentMs).toBe(10 * S)
+    expect(summarizeRuns([row] as never)[0]).toMatchObject({ agentMs: 10 * S, fellBack: 0 })
   })
 })
 

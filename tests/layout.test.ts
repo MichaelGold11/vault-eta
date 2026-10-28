@@ -20,6 +20,7 @@ const working = (over: Partial<EtaWorking> = {}): EtaWorking => ({
   leftSlowMs: 400_000,
   totalMs: 360_000,
   submit: { usualMs: 360_000, slowMs: 540_000 },
+  shape: null,
   n: 34,
   onTimePct: 82,
   scored: 11,
@@ -115,6 +116,22 @@ describe('narrow widths', () => {
     expect(band(v, 5)).toBe('~4m')
     expect(band(idle, 40)).toBe('last wrap 3:40 · today $38')
     expect(band(idle, 20)).toBe('last wrap 3:40')
+  })
+
+  test('a run that hands work to subagents says so, dim, at the end; the hint shortens first and goes first', () => {
+    const v = working({ shape: 'agents', taskType: 'freeform' })
+    expect(band(v)).toBe('~4m left · 2:10 in · $0.81 · freeform · subagents, usually longer')
+    expect(bandSegments(v).at(-1)?.full).toEqual([{ text: 'subagents, usually longer', look: 'dim' }])
+    expect(band(v, 60)).toBe('~4m left · 2:10 in · $0.81 · freeform · subagents')
+    expect(band(v, 30)).toBe('~4m · 2:10 · $0.81 · freeform')
+    expect(band(v, 20)).toBe('~4m · 2:10 · $0.81')
+    // the same tiers as a run without it once it has gone
+    expect(band(v, 15)).toBe(band(working({ taskType: 'freeform' }), 15))
+    // any other shape, or none yet: no hint
+    for (const shape of [null, 'answer', 'read', 'shell', 'edit']) expect(band(working({ shape, taskType: 'freeform' }))).toBe('~4m left · 2:10 in · $0.81 · freeform')
+    // it stays while the countdown says over usual, waiting or learning
+    expect(band(working({ shape: 'agents', state: 'past-slow', leftMs: null }))).toBe('over usual · 2:10 in · $0.81 · website-work · subagents, usually longer')
+    expect(band(working({ shape: 'agents', isWaiting: true }))).toMatch(/^waiting on you · .* · subagents, usually longer$/)
   })
 })
 
