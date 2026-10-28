@@ -33,7 +33,7 @@ const usage = (input: number, cacheWrite: number, cacheRead: number, output: num
 })
 const cents = (n: number | null) => (n === null ? null : Math.round(n * 1e6) / 1e6)
 
-describe('price table (claude-api skill, checked 2026-10-18)', () => {
+describe('price table (claude-api skill 2026-10-18; cache reads on the pricing page 2026-10-28)', () => {
   test('every current model at its published rates', () => {
     // per million, from 100K of each kind (a 100K prompt keeps Haiku 5.5 on its first card); cache writes at the 1h default
     const K = 100_000
@@ -47,12 +47,13 @@ describe('price table (claude-api skill, checked 2026-10-18)', () => {
     })
     expect(each('claude-fable-5-1')).toEqual({ input: 10, output: 50, read: 0.25, write1h: 20, write5m: 12.5 })
     expect(each('claude-opus-5-5')).toEqual({ input: 4, output: 20, read: 0.2, write1h: 8, write5m: 5 })
-    expect(each('claude-sonnet-5-5')).toEqual({ input: 2, output: 10, read: 0.2, write1h: 4, write5m: 2.5 })
+    // Sonnet 5.5 reads cache at 0.05x input, as the pricing page and Claude Code's own catalog (what /cost uses) have it
+    expect(each('claude-sonnet-5-5')).toEqual({ input: 2, output: 10, read: 0.1, write1h: 4, write5m: 2.5 })
     expect(each('claude-haiku-5-5')).toEqual({ input: 0.1, output: 0.5, read: 0.01, write1h: 0.2, write5m: 0.125 })
     expect(each('claude-fable-5')).toEqual({ input: 10, output: 50, read: 1, write1h: 20, write5m: 12.5 })
     expect(each('claude-opus-5')).toEqual({ input: 5, output: 25, read: 0.5, write1h: 10, write5m: 6.25 })
     expect(each('claude-opus-4-8')).toEqual(each('claude-opus-5'))
-    expect(each('claude-sonnet-5')).toEqual(each('claude-sonnet-5-5'))
+    expect(each('claude-sonnet-5')).toEqual({ input: 2, output: 10, read: 0.2, write1h: 4, write5m: 2.5 })
     expect(each('claude-sonnet-4-6')).toEqual({ input: 3, output: 15, read: 0.3, write1h: 6, write5m: 3.75 })
     expect(each('claude-haiku-4-5')).toEqual({ input: 1, output: 5, read: 0.1, write1h: 2, write5m: 1.25 })
   })
