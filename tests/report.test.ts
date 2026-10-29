@@ -192,6 +192,8 @@ describe('the report', () => {
     const lines = text.split('\n')
     // six wrap runs can be compared (the other seven fixture runs have too little behind them): all four predictors are listed in both tables
     expect(text).toContain("In sample, not the verdict's basis: the same 6 runs, each predicted from only the runs that ended before it started.")
+    // the scale is an interpolated quantile, so the match is to within a run or so, not exact
+    expect(text).toContain('"At matched coverage" scales a predictor\'s slow figure until it holds about as often as the uncorrected matcher\'s on these same runs (to within a run or so: the scale is an interpolated quantile), a fit that favours the baselines.')
     expect(text).toContain("Held out, the verdict's basis: the last 30% of the compared runs by start time (2 runs), each slow figure as it stands:")
     expect(text).toContain('| Predictor | Finished under slow | Median slow | Mean interval score |')
     for (const label of ['Matcher (uncorrected)', 'Matcher (corrected)', 'Per-type median and p80', 'Global median and p80']) {
@@ -221,10 +223,12 @@ describe('the report', () => {
   test('the verdict is computed by interval score, on time and on cost: unclear on a small holdout, and the section says why', () => {
     // the two held-out runs took 200 s and 400 s against a slow figure of 100 s from both: 100 + 5 x 100 and 100 + 5 x 300, a mean of 18m 20s
     expect(text).toContain(
-      '**Verdict on time: the matcher beats the per-type median out of sample, by interval score: unclear** (mean interval score 18m 20s against 18m 20s, 0.0% lower; the matcher scored lower in 0% of 500 resamples of the 2 held-out runs, where the two slow figures held 0% and 0% of the time).',
+      '**Verdict on time: the matcher beats the per-type median out of sample, by interval score: unclear** (mean interval score 18m 20s against 18m 20s, 0.0% lower; the matcher scored lower in 0% of 500 resamples of the 2 held-out runs, drawn 2 neighbours at a time, where the two slow figures held 0% and 0% of the time).',
     )
     expect(text).toContain('**Verdict on cost: the matcher beats the per-type median out of sample, by interval score: unclear**')
-    expect(text).toContain('Yes or no needs a mean score at least 5% lower that stays lower in at least 90% of the resamples, and at least 100 held-out runs')
+    expect(text).toContain(
+      'Yes or no needs a mean score at least 5% lower that stays lower in at least 97.5% of the resamples (drawn in blocks of neighbouring runs, since runs of one session go long or short together), and at least 100 held-out runs; otherwise unclear.',
+    )
     expect(text).toContain("A run's interval score is its slow figure plus five times any overrun past it")
   })
 
@@ -234,11 +238,24 @@ describe('the report', () => {
     const many = Array.from({ length: 60 }, (_, i) => row(`m${i}`, T0 - 60 * HOUR + i * HOUR, 100))
     const big = buildReport(many, { now: T0 })
     expect(big).toContain('Split-conformal calibration of the slow figure against the correction in use, on the same 17 held-out runs.')
+    // no promise it cannot keep: the factor is held at 4 (and is 1 under five runs), and the past ratios came from
+    // matchers fitted on other, growing histories, so they are not exchangeable with the next run's
+    expect(big).not.toContain('promises')
+    expect(big).toContain(
+      "It aims at 80% and guarantees nothing here: split-conformal's at-least-80% holds only when the past ratios are exchangeable with the next run's, and each of these came from a matcher fitted on a different, growing history; the factor is also held to 0.5 to 4 (1 under five runs), and past that cap it holds less often.",
+    )
     expect(big).toContain('| Slow figure | Finished under slow (target 80%) | Median slow | Mean interval score |')
-    // steady runs: both hold every time with the same figure, so conformal is no closer to 80% and is not used live
+    // steady runs: both hold every time with the same figure; 17 held out are too few to say either is better
     expect(big).toContain('| Correction in use | 100% (82% to 100%) | 1m 40s | 1m 40s |')
     expect(big).toContain('| Conformal, latest 100 | 100% (82% to 100%) | 1m 40s | 1m 40s |')
-    expect(big).toContain('The live estimate keeps the correction in use: conformal did not hold closer to 80% with a median slow figure no wider on these runs, so it stays an evaluated option.')
+    expect(big).toContain(
+      'The live estimate keeps the correction in use: 17 held-out runs are too few to say either is better (the bar for live use needs 100, as the verdict does), so conformal stays an evaluated option.',
+    )
+    // from 100 held out the bar is judged: both hold every time, the same figure, so conformal is no better
+    const lots = buildReport(Array.from({ length: 360 }, (_, i) => row(`l${i}`, T0 - 360 * HOUR + i * HOUR, 100)), { now: T0 })
+    expect(lots).toContain(
+      'The live estimate keeps the correction in use: conformal did not clear the bar for live use on these runs (the correction in use missing 80% by more than chance while conformal does not and holds closer, with a median slow figure no wider), so it stays an evaluated option.',
+    )
   })
 
   test('drift: coverage by month and by main model, with a plain statement', () => {
@@ -269,6 +286,17 @@ describe('the report', () => {
     // with each run's own label, wrap is matched to wrap: every run holds
     expect(hit("Once the labels are known (each run's own task type and project)")).toBe(100)
     expect(accuracy.some(l => l.startsWith('The second row is better informed than any estimate at submit'))).toBe(true)
+  })
+
+  test('accuracy says how the slow figures from a few matches held, and why they run optimistic', () => {
+    // one type of steady runs: the 5th to 9th have 5 to 9 runs behind them, too few to give a rate
+    const one = buildReport(Array.from({ length: 60 }, (_, i) => row(`m${i}`, T0 - 60 * HOUR + i * HOUR, 100)), { now: T0 })
+    expect(one).toContain(
+      '5 of the 55 runs scored at submit had fewer than 10 matching runs behind their slow figure. The 80th percentile of a few past runs holds only about three times in four even when they are the right runs, so the slow figure for a new or rare kind of task is optimistic.',
+    )
+    // eight types of twelve: forty with a few matches, enough for a rate
+    const eight = buildReport(Array.from({ length: 96 }, (_, i) => row(`t${i}`, T0 - 100 * HOUR + i * HOUR, 100, { taskType: `type-${i % 8}` })), { now: T0 })
+    expect(eight).toContain('40 of the 56 runs scored at submit had fewer than 10 matching runs behind their slow figure, and finished under it 100% (91% to 100%). ')
   })
 
   test('the cost table scores the same replay on dollars', () => {

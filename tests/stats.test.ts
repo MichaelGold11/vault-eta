@@ -19,6 +19,7 @@ import {
   scoreBaselines,
   scoreConformal,
   CONFORMAL_WINDOW,
+  FEW_MATCHES,
   scoreByType,
   scoreCost,
   scoreGroups,
@@ -186,6 +187,11 @@ describe('scoring itself', () => {
     expect(near(cal.factor, 1.38)).toBe(true)
     expect(calibrate(scored.slice(0, 3)).factor).toBe(1)
     expect(calibrate([]).coverage).toBe(null)
+  })
+
+  test('a negative actual time is not a run to score: it would read as held and pull the factor down', () => {
+    const negative = Array.from({ length: 6 }, () => ({ slowMs: 100, actualMs: -50 }))
+    expect(calibrate(negative)).toEqual({ n: 0, coverage: null, factor: 1 })
   })
 
   test('per task type: which estimate missed by less', () => {
@@ -573,6 +579,32 @@ describe('scoring cost and groups', () => {
     expect(got.edit?.coverage).toBe(1)
     expect((got.edit?.n ?? 0) + (got.read?.n ?? 0)).toBe(3)
   })
+
+  test('scoreGroups can group by what the estimate had: the replayed row, such as how many matches were behind it', () => {
+    // run i has i runs behind it: 5 to 9 have fewer than FEW_MATCHES, 10 to 24 have more
+    const rows = Array.from({ length: 25 }, (_, i) => timed(`m${i}`, i * HOUR, 100))
+    const got = scoreGroups(rows, (_, row) => (row.n < FEW_MATCHES ? 'few' : 'more'))
+    expect(FEW_MATCHES).toBe(10)
+    expect(got.few?.n).toBe(5)
+    expect(got.more?.n).toBe(15)
+  })
+
+  test('a slow figure from a few matches holds less often than 80% even when they are the right runs', () => {
+    // the 80th percentile of n log-normal runs, against the next run from the same spread: about three in four from 5 to 9
+    let seed = 12345
+    const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647
+    const draw = () => Math.exp(Math.sqrt(-2 * Math.log(rnd())) * Math.cos(2 * Math.PI * rnd()))
+    const held = (n: number) => {
+      let hits = 0
+      for (let t = 0; t < 4000; t++) if (draw() <= (quantile(Array.from({ length: n }, draw), 0.8) ?? 0)) hits++
+      return hits / 4000
+    }
+    for (const n of [5, 9]) {
+      const rate = held(n)
+      expect(rate > 0.7 && rate < 0.77).toBe(true)
+    }
+    expect(held(50) > 0.77).toBe(true)
+  })
 })
 
 describe('wilson interval', () => {
@@ -589,6 +621,14 @@ describe('wilson interval', () => {
     const wide = wilson(8, 10)
     const tight = wilson(800, 1000)
     expect((tight?.hi ?? 0) - (tight?.lo ?? 0) < (wide?.hi ?? 0) - (wide?.lo ?? 0)).toBe(true)
+  })
+
+  test('a hit count outside 0 to n has no interval, not NaN', () => {
+    expect(wilson(11, 10)).toBe(null)
+    expect(wilson(-1, 10)).toBe(null)
+    expect(wilson(3, 2.5)).toBe(null)
+    expect(wilson(Number.NaN, 10)).toBe(null)
+    expect(wilson(5, Infinity)).toBe(null)
   })
 })
 
@@ -618,6 +658,19 @@ describe('out-of-sample baselines', () => {
     expect(again?.holdout?.predictors.type.scale).toBe(got?.holdout?.predictors.type.scale)
   })
 
+  test('a training run still going when the held-out runs start does not feed the scale: training is what had ended by then', () => {
+    // 40 runs an hour apart, and one that starts in the training stretch and is left waiting overnight, ending after every held-out run started
+    const runs = Array.from({ length: 40 }, (_, i) => timed(`s${i}`, i * HOUR, 60 + ((i * 37) % 100)))
+    const parked = (seconds: number) => ({ ...timed('parked', 20.5 * HOUR, seconds), endedAt: 1000 * HOUR })
+    const quick = scoreBaselines([...runs, parked(30)]).all?.holdout
+    const long = scoreBaselines([...runs, parked(3000)]).all?.holdout
+    // 36 rows: the split is at the 26th (s29); the parked run started before it but had not ended, so it is on neither side
+    expect(quick?.n).toBe(11)
+    expect(quick?.trainN).toBe(24)
+    for (const name of ['type', 'global', 'matcherCorrected'] as const) expect(long?.predictors[name].scale).toBe(quick?.predictors[name].scale ?? -1)
+    expect(scoreConformal([...runs, parked(30)])?.trainN).toBe(24)
+  })
+
   test('the held-out rows are all later than the training rows', () => {
     const rows = [...steady(25), ...steady(25, 'other', 30 * HOUR)]
     const got = scoreBaselines(rows)
@@ -635,8 +688,24 @@ describe('out-of-sample baselines', () => {
     expect(scoreBaselines(steady(6)).all?.holdout).toBe(null)
   })
 
+  test('no comparable runs give no hit rate, not NaN', () => {
+    for (const got of [scoreBaselines(steady(5)).all, scoreBaselines([]).all]) {
+      expect(got?.n).toBe(0)
+      for (const name of ['matcher', 'matcherCorrected', 'type', 'global'] as const) {
+        expect(got?.predictors[name].coverage).toBe(null)
+        expect(got?.predictors[name].scale).toBe(1)
+      }
+    }
+  })
+
   test('the matcher keeps a scale of 1 out of sample', () => {
     expect(scoreBaselines(steady(25)).all?.holdout?.predictors.matcher.scale).toBe(1)
+  })
+
+  test('every figure compared is an 80th percentile and is scored as one: a target option changes nothing', () => {
+    // with overruns in the held-out runs, scoring at 90% would weigh them ten times instead of five
+    const runs = [...steady(20), ...Array.from({ length: 5 }, (_, i) => timed(`tail${i}`, (20 + i) * HOUR, 1000))]
+    expect(scoreBaselines(runs, { target: 0.9 } as never)).toEqual(scoreBaselines(runs))
   })
 
   test('the holdout also scores each slow figure as it stands, by its interval score per run', () => {
@@ -689,6 +758,13 @@ describe('the interval score', () => {
     const best = [40, 60, 70, 80, 90, 100, 120].reduce((b, s) => (mean(s) < mean(b) ? s : b))
     expect(best).toBe(80)
   })
+
+  test('a target outside 0 to 1 is refused: at 1 the overrun weight is infinite, past it negative', () => {
+    expect(() => intervalScore(100, 100, 1)).toThrow('target')
+    expect(() => intervalScore(100, 120, 1.2)).toThrow('target')
+    expect(() => intervalScore(100, 120, 0)).toThrow('target')
+    expect(() => intervalScore(100, 120, Number.NaN)).toThrow('target')
+  })
 })
 
 describe('the paired bootstrap', () => {
@@ -709,6 +785,28 @@ describe('the paired bootstrap', () => {
     // a resample draws that run at least once about 1 - 1/e of the time
     expect((rate ?? 0) > 0.55 && (rate ?? 1) < 0.72).toBe(true)
   })
+
+  test('in blocks of neighbouring runs: a gap carried by one stretch wins only the resamples whose blocks reach it', () => {
+    // ten neighbouring runs (one session, say) carry the whole gap
+    const a = Array.from({ length: 150 }, () => 100)
+    const b = a.map((x, i) => (i >= 70 && i < 80 ? 250 : x))
+    // run by run, nearly every resample draws one of the ten
+    expect((bootstrapWins(a, b) ?? 0) > 0.99).toBe(true)
+    // twelve blocks of 13: a block reaches the stretch 22 times in 150, so about 1 - (1 - 22/150)^12 of the resamples
+    const blocks = bootstrapWins(a, b, { block: 13 }) ?? 1
+    expect(blocks > 0.78 && blocks < 0.92).toBe(true)
+    // one block of every run is the whole series, turned: the sum never changes
+    expect(bootstrapWins(a, b, { block: 150 })).toBe(1)
+    expect(bootstrapWins(b, a, { block: 150 })).toBe(0)
+  })
+
+  test('scores that do not pair up, no rounds, or a score that is not a number give no rate', () => {
+    // run by run, a 1000 with no partner would be dropped, and it is the run that decides
+    expect(bootstrapWins([1, 1, 1, 1000], [2, 2, 2])).toBe(null)
+    expect(bootstrapWins([1, 2], [2, 3], { rounds: 0 })).toBe(null)
+    expect(bootstrapWins([1, Number.NaN], [2, 3])).toBe(null)
+    expect(bootstrapWins([1, Infinity], [2, 3])).toBe(null)
+  })
 })
 
 describe('the baseline verdict', () => {
@@ -720,7 +818,7 @@ describe('the baseline verdict', () => {
   /** n runs' scores spread around `level`, the same spread at every level, so a pair differs only by the level. */
   const around = (n: number, level: number) => Array.from({ length: n }, (_, i) => level + ((i * 37) % 21) - 10)
 
-  test('yes when the matcher scores at least 5% lower and stays lower in 90% of resamples; no by the mirror rule', () => {
+  test('yes when the matcher scores at least 5% lower and stays lower in 97.5% of resamples; no by the mirror rule', () => {
     const v = baselineVerdict(score(around(150, 90), around(150, 100)))
     expect(v.verdict).toBe('yes')
     expect(v.winRate).toBe(1)
@@ -734,11 +832,46 @@ describe('the baseline verdict', () => {
     expect(baselineVerdict(score(around(150, 103), around(150, 100))).verdict).toBe('unclear')
   })
 
-  test('a gap carried by one run is unclear: it does not hold in 90% of resamples', () => {
+  test('a gap carried by one run is unclear: it does not hold in 97.5% of resamples', () => {
     const v = baselineVerdict(score(Array.from({ length: 150 }, () => 100), Array.from({ length: 150 }, (_, i) => (i === 0 ? 2000 : 100))))
     expect((v.ratio ?? 1) <= 0.95).toBe(true)
-    expect((v.winRate ?? 1) < 0.9).toBe(true)
+    expect((v.winRate ?? 1) < 0.975).toBe(true)
     expect(v.verdict).toBe('unclear')
+  })
+
+  test('a gap carried by one stretch of neighbouring runs is unclear: the resamples draw them in blocks', () => {
+    // ten neighbouring held-out runs (one session, say) carry a 9% gap; run by run it held in nearly every resample
+    const v = baselineVerdict(score(Array.from({ length: 150 }, () => 100), Array.from({ length: 150 }, (_, i) => (i >= 70 && i < 80 ? 250 : 100))))
+    expect((v.ratio ?? 1) <= 0.95).toBe(true)
+    expect(v.block).toBe(13)
+    expect((v.winRate ?? 1) < 0.975).toBe(true)
+    expect(v.verdict).toBe('unclear')
+  })
+
+  test('with no real gap a verdict is rare, even when neighbouring runs move together', () => {
+    // 100 held-out series of 150 runs where neither figure is better: a shared heavy-tailed level per run and a relative
+    // edge that drifts from run to run (autocorrelation 0.8) and averages zero. Run by run at 90%, about half said yes or no.
+    let seed = 4242
+    const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647
+    const normal = () => {
+      const u = rnd()
+      const w = rnd()
+      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * w)
+    }
+    let decided = 0
+    for (let r = 0; r < 100; r++) {
+      let e = 0
+      const m: number[] = []
+      const t: number[] = []
+      for (let i = 0; i < 150; i++) {
+        e = 0.8 * e + 0.6 * normal()
+        const level = 100 * Math.exp(0.8 * normal())
+        m.push(Math.max(1, level * (1 + 0.15 * e)))
+        t.push(Math.max(1, level * (1 - 0.15 * e)))
+      }
+      if (baselineVerdict(score(m, t)).verdict !== 'unclear') decided++
+    }
+    expect(decided / 100 < 0.3).toBe(true)
   })
 
   test('under 100 held-out runs is unclear', () => {
@@ -749,6 +882,12 @@ describe('the baseline verdict', () => {
   test('nothing held out is unclear', () => {
     expect(baselineVerdict(undefined).verdict).toBe('unclear')
     expect(baselineVerdict({ n: 3, predictors: {}, holdout: null } as never).verdict).toBe('unclear')
+  })
+
+  test('scores that do not pair up are unclear, with no resample rate', () => {
+    const v = baselineVerdict(score([...around(150, 50), 50], around(150, 100)))
+    expect(v.winRate).toBe(null)
+    expect(v.verdict).toBe('unclear')
   })
 })
 
@@ -768,8 +907,10 @@ describe('conformal calibration of the slow figure', () => {
     expect(near(calibrate(ten).factor, 1.2 + (1.5 - 1.2) * 0.2)).toBe(true)
     // too few to promise the target: five runs at 95% need rank 6
     expect(calibrate(eight.slice(0, 5), { conformal: true, target: 0.95 }).factor).toBe(1)
-    // held to 0.5..4 like the fitted one, and 1 under five runs
-    expect(calibrate(eight.map(s => ({ ...s, actualMs: s.actualMs * 10 })), { conformal: true }).factor).toBe(4)
+    // held to 0.5..4 like the fitted one, and 1 under five runs; past the cap the at-least-80% is gone: none of these holds
+    const tenfold = eight.map(s => ({ ...s, actualMs: s.actualMs * 10 }))
+    expect(calibrate(tenfold, { conformal: true }).factor).toBe(4)
+    expect(tenfold.filter(s => s.actualMs <= s.slowMs * 4).length).toBe(0)
     expect(calibrate(eight.slice(0, 4), { conformal: true }).factor).toBe(1)
   })
 
@@ -837,12 +978,40 @@ describe('conformal calibration of the slow figure', () => {
     expect((conf?.conformal.score ?? Infinity) < (conf?.fitted.score ?? 0)).toBe(true)
   })
 
-  test('the bar for live use: coverage closer to 80% with a median slow figure no wider', () => {
-    expect(passesBar({ coverage: 0.86, slowMs: 100 }, { coverage: 0.81, slowMs: 100 })).toBe(true)
-    expect(passesBar({ coverage: 0.74, slowMs: 100 }, { coverage: 0.78, slowMs: 95 })).toBe(true)
-    expect(passesBar({ coverage: 0.86, slowMs: 100 }, { coverage: 0.81, slowMs: 101 })).toBe(false)
-    expect(passesBar({ coverage: 0.82, slowMs: 100 }, { coverage: 0.82, slowMs: 90 })).toBe(false)
-    expect(passesBar({ coverage: 0.8, slowMs: null }, { coverage: 0.8, slowMs: 1 })).toBe(false)
+  test('the bar for live use: the one in use off 80% by more than chance and conformal not, no wider, on 100 held-out runs', () => {
+    // 352 held out: 86% is off 80% beyond chance (its interval is 82% to 89%), 81% is not (77% to 85%)
+    expect(passesBar({ coverage: 0.86, slowMs: 100 }, { coverage: 0.81, slowMs: 100 }, 352)).toBe(true)
+    expect(passesBar({ coverage: 0.72, slowMs: 100 }, { coverage: 0.79, slowMs: 95 }, 352)).toBe(true)
+    expect(passesBar({ coverage: 0.86, slowMs: 100 }, { coverage: 0.81, slowMs: 101 }, 352)).toBe(false)
+    // two corrections within chance of 80% are equivalent, however the hit rates fall: the old bar passed this one
+    expect(passesBar({ coverage: 0.82, slowMs: 100 }, { coverage: 0.8, slowMs: 90 }, 352)).toBe(false)
+    // closer, but still off by more than chance on the far side
+    expect(passesBar({ coverage: 0.9, slowMs: 100 }, { coverage: 0.74, slowMs: 90 }, 352)).toBe(false)
+    // under the verdict's 100 held-out runs nothing is claimed, however clear
+    expect(passesBar({ coverage: 0.5, slowMs: 100 }, { coverage: 0.8, slowMs: 90 }, 99)).toBe(false)
+    expect(passesBar({ coverage: 0.5, slowMs: 100 }, { coverage: 0.8, slowMs: 90 }, 100)).toBe(true)
+    expect(passesBar({ coverage: 0.8, slowMs: null }, { coverage: 0.8, slowMs: 1 }, 352)).toBe(false)
+  })
+
+  test('two equivalent corrections do not pass the bar: independent runs, where both hold about 80%', () => {
+    // 600 lognormal runs of one type over eight projects: neither correction is better, yet the old bar passed this history
+    let seed = 7
+    const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647
+    const normal = () => {
+      const u = rnd()
+      const w = rnd()
+      return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * w)
+    }
+    const runs = Array.from({ length: 600 }, (_, i) => {
+      const project = `p${Math.floor(rnd() * 8)}`
+      return timed(`r${i}`, i * HOUR, Math.exp(1.5 * normal()) * 100, { project })
+    })
+    const conf = scoreConformal(runs)
+    expect((conf?.n ?? 0) >= 100).toBe(true)
+    // both within a couple of points of 80%
+    expect(Math.abs((conf?.fitted.coverage ?? 0) - 0.8) < 0.03).toBe(true)
+    expect(Math.abs((conf?.conformal.coverage ?? 0) - 0.8) < 0.03).toBe(true)
+    expect(conf?.better).toBe(false)
   })
 
   test('too few runs hold nothing out', () => {

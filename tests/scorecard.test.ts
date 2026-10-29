@@ -63,9 +63,17 @@ describe('the scorecard', () => {
     expect(text).toContain('## Cost estimate')
     expect(text).toMatch(/\*\*(yes|no|unclear)\*\* \(/)
     // the verdict is by interval score, on time and on cost, with both scores and the resample rate
-    expect(text).toMatch(/on time, out of sample, by interval score\? \*\*(yes|no|unclear)\*\* \(mean interval score \d+m \d+s against \d+m \d+s, \d+\.\d% (lower|higher), lower in \d+% of 500 resamples; \d+ runs held out\)\./)
+    expect(text).toMatch(/on time, out of sample, by interval score\? \*\*(yes|no|unclear)\*\* \(mean interval score \d+m \d+s against \d+m \d+s, \d+\.\d% (lower|higher), lower in \d+% of 500 resamples in blocks of \d+; \d+ runs held out\)\./)
     expect(text).toMatch(/on cost, out of sample, by interval score\? \*\*(yes|no|unclear)\*\* \(mean interval score \$[\d.]+ against \$[\d.]+, /)
+    // the rule as the verdict applies it: 97.5% of the resamples, drawn in blocks
+    expect(text).toContain('stays lower in at least 97.5% of the resamples (drawn in blocks of neighbouring runs, since runs of one session go long or short together), and at least 100 held-out runs.')
     expect(text).toMatch(/Has the slow figure's hit rate shifted between months or between models\? \*\*(yes|no|too few runs to say)\*\*/)
+  })
+
+  test('says how the slow figures from a few matches held, with counts only', () => {
+    const text = buildScorecard(rows)
+    // two types of forty: the 5th to 9th of each have 5 to 9 runs behind them
+    expect(text).toMatch(/\n10 of the \d+ scored runs had fewer than 10 matching runs behind their slow figure\. The 80th percentile of a few past runs holds only about three times in four even when they are the right runs, so the slow figure for a new or rare kind of task is optimistic\.\n/)
   })
 
   test('drift never prints a bare answer: it says too few runs under 30 per group, and states the rule otherwise', () => {
