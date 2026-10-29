@@ -12,16 +12,19 @@ import {
   isNoticeText,
   isProjectsFolder,
   isPersonPrompt,
+  lineCount,
   linesChanged,
   normalizePath,
   parseList,
   projectFromPath,
+  projectFromSkill,
   relativePath,
   shapeOf,
   taskIdOf,
+  toolPath,
 } from '../lib/classify.mjs'
-import { fmtSecs, fmtTok, fmtUsd, formatClock, formatCost } from '../lib/format.mjs'
-import { PRICES, costOf, familyOf, normalizeModel, priceOf, tokensOf } from '../lib/price.mjs'
+import { fmtCost, fmtDur, fmtSecs, fmtTok, fmtUsd, formatClock, formatCost } from '../lib/format.mjs'
+import { PRICES, costOf, familyOf, modelKey, normalizeModel, priceOf, tokensOf } from '../lib/price.mjs'
 import { clip, lengthOf, overlapMs, subtract, union } from '../lib/spans.mjs'
 
 const M = 1_000_000
@@ -332,5 +335,67 @@ describe('where the mod may write', () => {
     expect(await writeRefusal(disk({ dirs: ['/v', '/v/a.md'] }), '/v', '/v/a.md')).toBe('a.md is not a file')
     expect(await writeRefusal(disk({}), '/v', '/v/a.md')).toBe('the folder could not be resolved')
     expect([isInside('C:\\Users\\Me\\Notes\\a', 'c:/users/me/notes'), isInside('/v2/a', '/v')]).toEqual([true, false])
+  })
+})
+
+describe('fmtCost and fmtDur', () => {
+  test('fmtCost: the dollars, a plus when some part had no price, two dashes when none did', () => {
+    expect(fmtCost(1.2, 3, 0)).toBe('$1.20')
+    expect(fmtCost(1.2, 2, 1)).toBe('$1.20+')
+    expect(fmtCost(0, 0, 2)).toBe('--')
+    expect(fmtCost(0, 0, 0)).toBe('$0')
+    expect(fmtCost(0.25, 1, 1)).toBe('$0.250+')
+  })
+
+  test('fmtDur: seconds, minutes with padded seconds, hours with padded minutes; never negative', () => {
+    expect(fmtDur(0)).toBe('0s')
+    expect(fmtDur(42_400)).toBe('42s')
+    expect(fmtDur(59_600)).toBe('1m 00s')
+    expect(fmtDur(252_000)).toBe('4m 12s')
+    expect(fmtDur(7_500_000)).toBe('2h 05m')
+    expect(fmtDur(-5000)).toBe('0s')
+  })
+})
+
+describe('modelKey', () => {
+  test('the bare id a model is matched on, from any spelling; null when there is none', () => {
+    expect(modelKey('claude-opus-5-5')).toBe('claude-opus-5-5')
+    expect(modelKey('us.anthropic.claude-opus-5-5')).toBe('claude-opus-5-5')
+    expect(modelKey('claude-opus-5-5[1m]')).toBe('claude-opus-5-5')
+    expect(modelKey('Claude-Haiku-4-5-20251001')).toBe('claude-haiku-4-5')
+    expect(modelKey('')).toBe(null)
+    expect(modelKey('unknown')).toBe(null)
+    expect(modelKey(undefined)).toBe(null)
+  })
+})
+
+describe('toolPath, lineCount and projectFromSkill', () => {
+  test('toolPath: the file of a file tool, the folder of a search tool, nothing for the rest', () => {
+    expect(toolPath('Read', { file_path: '/a/b.md' })).toEqual({ path: '/a/b.md', isDir: false })
+    expect(toolPath('NotebookEdit', { notebook_path: '/a/n.ipynb' })).toEqual({ path: '/a/n.ipynb', isDir: false })
+    expect(toolPath('Grep', { path: 'src', pattern: 'x' })).toEqual({ path: 'src', isDir: true })
+    expect(toolPath('Glob', { pattern: '*.md' })).toEqual({ path: '.', isDir: true })
+    expect(toolPath('Read', { file_path: '' })).toBe(null)
+    expect(toolPath('Bash', { command: 'ls' })).toBe(null)
+    expect(toolPath('Read', null)).toBe(null)
+    expect(toolPath('Read', 'x')).toBe(null)
+  })
+
+  test('lineCount: a last line without a break still counts; a trailing break does not add one', () => {
+    expect(lineCount('')).toBe(0)
+    expect(lineCount(null)).toBe(0)
+    expect(lineCount('a')).toBe(1)
+    expect(lineCount('a\n')).toBe(1)
+    expect(lineCount('a\nb')).toBe(2)
+    expect(lineCount('a\n\nb\n')).toBe(3)
+  })
+
+  test('projectFromSkill: the project of a `<project>-work` skill, lower case', () => {
+    expect(projectFromSkill('website-work')).toBe('website')
+    expect(projectFromSkill('My-App-Work')).toBe('my-app')
+    expect(projectFromSkill('work')).toBe(null)
+    expect(projectFromSkill('-work')).toBe(null)
+    expect(projectFromSkill('website-review')).toBe(null)
+    expect(projectFromSkill(undefined)).toBe(null)
   })
 })

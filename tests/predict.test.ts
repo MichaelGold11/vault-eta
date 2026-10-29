@@ -52,7 +52,8 @@ function row(r: RowIn): TurnRow {
     steps,
     tools: r.tools ?? [],
     errors: { tools: 0, steps: 0 },
-    task: { taskType: r.taskType ?? 'website-work', skill: null, command: null, project: r.project === undefined ? 'website' : r.project, job: null, promptChars: 100, origin: 'composer', runStart: start },
+    // a typed run is named by its slash command, so its task type is known at submit, as the self-score's replay requires
+    task: { taskType: r.taskType ?? 'website-work', skill: null, command: (r.taskType ?? 'website-work') === 'freeform' ? null : (r.taskType ?? 'website-work'), project: r.project === undefined ? 'website' : r.project, job: null, promptChars: 100, origin: 'composer', runStart: start },
     cond: { contextStart: null, contextTurn: null, cache: null, hour: 12, weekday: 0, tzOffsetMin: 300, permissionMode: null, version: null, cwdName: 'vault' },
     ...(r.eta ? { eta: r.eta } : {}),
   }

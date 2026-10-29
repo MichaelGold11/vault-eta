@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 
-import { agentMsBefore, dedupeRuns, earlyByRun, earlyFacts, groupByRun, isPlaced, summarizeRuns } from '../lib/aggregate.mjs'
+import { agentMsBefore, dedupeRuns, earlyByRun, earlyFacts, groupByRun, isPlaced, markFollowUps, runClock, summarizeRuns } from '../lib/aggregate.mjs'
 
 /** Equal to nine decimal places (the kit has no toBeCloseTo). */
 const near = (a: number | null | undefined, b: number) => typeof a === 'number' && Math.abs(a - b) < 1e-9
@@ -215,5 +215,110 @@ describe('runs from rows', () => {
     expect(earlyByRun(rows as never).get('p1')?.facts.steps).toBe(3)
     // no tools in the first two requests: an answer
     expect(groupByRun([row({ runId: 'q', start: T0, end: T0 + 1000, steps: [step(0)] })] as never)[0]?.shape).toBe('answer')
+  })
+
+  test('the labels known at submit: the kept estimate\'s, else what the first two requests showed, never more than the run\'s own', () => {
+    const step = (at: number) => ({ at, ms: 500, stop: 'tool_use' })
+    const steps = [step(0), step(2000), step(4000), step(6000)]
+    const task = (taskType: string, project: string | null, command: string | null = null) => ({ taskType, skill: command ? null : taskType === 'freeform' ? null : taskType, command, project, job: null, promptChars: 20, origin: 'composer' })
+    const one = (runId: string, over: Partial<Row>) => row({ runId, start: T0, end: T0 + 10_000, steps, src: 'backfill', ...over })
+    const at = (rows: Row[]) => {
+      const [r] = summarizeRuns(rows as never)
+      return { own: [r?.taskType, r?.project], submit: [r?.submitTaskType, r?.submitProject] }
+    }
+    // a live run's kept estimate says what it knew, whatever the run went on to do
+    const eta = { taskType: 'freeform', project: null, model: 'claude-opus-5-5', level: 'type+model', n: 9, learning: null, usualMs: 1000, slowMs: 2000, usualUsd: null, slowUsd: null, factor: 1, steps: 2 }
+    expect(at([one('live', { src: 'live', eta, task: task('wrap', 'website'), tools: [{ at: 4500, name: 'Skill', skill: 'wrap', ms: 5 }] })])).toEqual({ own: ['wrap', 'website'], submit: ['freeform', null] })
+    // a backfilled run: a skill loaded in the first request and a folder edited in the second were known
+    const early = [
+      { at: 500, name: 'Skill', skill: 'website-work', ms: 5 },
+      { at: 2500, name: 'Edit', dir: '01-projects/website/plan', ms: 5 },
+    ]
+    expect(at([one('b1', { task: task('website-work', 'website'), tools: early })])).toEqual({ own: ['website-work', 'website'], submit: ['website-work', 'website'] })
+    // the same skill loaded in the third request and the folder edited in the fourth were not
+    const late = [
+      { at: 4500, name: 'Skill', skill: 'wrap', ms: 5 },
+      { at: 6500, name: 'Edit', dir: '01-projects/website/plan', ms: 5 },
+    ]
+    expect(at([one('b2', { task: task('wrap', 'website'), tools: late })])).toEqual({ own: ['wrap', 'website'], submit: ['freeform', null] })
+    // a slash command is known at submit, and a project skill's name gives its project
+    expect(at([one('b3', { task: task('website-work', 'website', 'website-work'), tools: [] })])).toEqual({ own: ['website-work', 'website'], submit: ['website-work', 'website'] })
+    expect(at([one('b4', { task: task('wrap', 'website', 'wrap'), tools: late })])).toEqual({ own: ['wrap', 'website'], submit: ['wrap', null] })
+    // a label the rows do not explain (no Skill call or command names it) was not known at submit
+    expect(at([one('b5', { task: task('wrap', 'website'), tools: [] })])).toEqual({ own: ['wrap', 'website'], submit: ['freeform', null] })
+    // an early skill the run's own labelling skipped (an ignored one, a router) does not name it at submit either
+    const ignored = [{ at: 500, name: 'Skill', skill: 'kickoff', ms: 5 }, ...late]
+    expect(at([one('b6', { task: task('wrap', 'website'), tools: ignored })])).toEqual({ own: ['wrap', 'website'], submit: ['freeform', null] })
+    // an early folder in another project than the run's own: not taken for either
+    const elsewhere = [{ at: 500, name: 'Edit', dir: '01-projects/acme', ms: 5 }]
+    expect(at([one('b7', { task: task('freeform', 'website'), tools: elsewhere })])).toEqual({ own: ['freeform', 'website'], submit: ['freeform', null] })
+  })
+})
+
+describe('runClock', () => {
+  test('parallel loops count once; the main loop is its own part', () => {
+    // main 0 to 10 s, a subagent 5 to 25 s: 25 s on the clock, 10 s of it the main loop's
+    const c = runClock([
+      row({ runId: 'c1', start: T0, end: T0 + 10_000, agentMs: 10_000 }),
+      row({ runId: 'c1', agentId: 'a1', start: T0 + 5000, end: T0 + 25_000, agentMs: 20_000 }),
+    ] as never)
+    expect(c).toEqual({ agentMs: 25_000, mainMs: 10_000, waitMs: 0, sleepMs: 0, fellBack: 0 })
+  })
+
+  test('a gap where nothing worked is nobody\'s; a wait on the person is cut out and counted as a wait', () => {
+    const gap = runClock([
+      row({ runId: 'c2', start: T0, end: T0 + 10_000, agentMs: 10_000 }),
+      row({ runId: 'c2', turnId: 'n', start: T0 + 60_000, end: T0 + 70_000, agentMs: 10_000 }),
+    ] as never)
+    expect(gap.agentMs).toBe(20_000)
+    const waited = runClock([row({ runId: 'c3', start: T0, end: T0 + 100_000, agentMs: 70_000, waitMs: 30_000, tools: [{ at: 10_000, name: 'Bash', ms: 30_000, waitMs: 30_000 }] })] as never)
+    expect(waited.agentMs).toBe(70_000)
+    expect(waited.waitMs).toBe(30_000)
+  })
+
+  test('a backfilled row loses its idle stretch over ten minutes; a row that cannot be placed adds its stored time and is counted', () => {
+    const steps = [{ at: 0, ms: 10_000 }, { at: 1_200_000, ms: 300_000 }]
+    const imported = runClock([row({ runId: 'c4', src: 'backfill', start: T0, end: T0 + 1_500_000, agentMs: 1_500_000, steps } as never)] as never)
+    expect(imported.agentMs).toBe(310_000)
+    expect(imported.fellBack).toBe(0)
+    // a live window of 10 s that stores 5 s with no wait to explain the difference
+    const lost = runClock([row({ runId: 'c5', start: T0, end: T0 + 10_000, agentMs: 5000 })] as never)
+    expect(lost.fellBack).toBe(1)
+    expect(lost.agentMs).toBe(5000)
+    expect(lost.mainMs).toBe(5000)
+  })
+})
+
+describe('markFollowUps', () => {
+  const run = (sessionId: string, startedAt: number, mainEndedAt: number, project: string | null = 'website') => ({ sessionId, startedAt, mainEndedAt, project, followedUp: false })
+
+  test('a run whose next prompt in the same session and project came within two minutes is marked; the last run of a session never is', () => {
+    const runs = [run('s1', 0, 60_000), run('s1', 150_000, 200_000), run('s1', 400_000, 450_000), run('s2', 100_000, 110_000)]
+    markFollowUps(runs as never)
+    // 150 s - 60 s = 90 s: followed up; 400 s - 200 s = 200 s: not; last of the session and a lone session: not
+    expect(runs.map(r => r.followedUp)).toEqual([true, false, false, false])
+  })
+
+  test('exactly two minutes counts; another project does not; a next run that began before the last ended does not', () => {
+    const edge = [run('s1', 0, 10_000), run('s1', 130_000, 140_000)]
+    markFollowUps(edge as never)
+    expect(edge[0]?.followedUp).toBe(true)
+    const other = [run('s1', 0, 10_000, 'website'), run('s1', 20_000, 30_000, 'app')]
+    markFollowUps(other as never)
+    expect(other[0]?.followedUp).toBe(false)
+    const overlap = [run('s1', 0, 50_000), run('s1', 20_000, 60_000)]
+    markFollowUps(overlap as never)
+    expect(overlap[0]?.followedUp).toBe(false)
+  })
+
+  test('summarizeRuns applies it, and clears a mark that no longer holds', () => {
+    const rows = [row({ runId: 'f1', start: T0, end: T0 + 10_000 }), row({ runId: 'f2', start: T0 + 60_000, end: T0 + 70_000 })]
+    const [a, b] = summarizeRuns(rows as never)
+    expect([a?.followedUp, b?.followedUp]).toEqual([true, false])
+    if (a) a.followedUp = true
+    const later = [run('s1', 0, 10_000), run('s1', 900_000, 910_000)]
+    later[0]!.followedUp = true
+    markFollowUps(later as never)
+    expect(later[0]?.followedUp).toBe(false)
   })
 })

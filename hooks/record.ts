@@ -6,6 +6,7 @@ import {
   isNoticeText,
   isPersonPrompt,
   SHAPE_STEPS,
+  SUBMIT_STEPS,
   shapeOf,
   linesChanged,
   taskIdOf,
@@ -839,7 +840,7 @@ export class Recorder {
   /** The run's estimate at submit; replaced while its first two main requests settle the task. */
   setEstimate(runId: string, eta: StoredEta) {
     const run = this.runs.get(runId)
-    if (run && (run.eta === null || run.mainSteps <= 2)) run.eta = eta
+    if (run && (run.eta === null || run.mainSteps <= SUBMIT_STEPS)) run.eta = eta
   }
 
   /** A step-time estimate of the whole run, made `atMs` of agent time in. */

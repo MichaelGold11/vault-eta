@@ -2,7 +2,7 @@ import { atom, update } from 'claude-code'
 import type { EngineInterface, Register, Timer, TurnStepResult } from 'claude-code'
 
 import { resolveBase } from '../lib/base.mjs'
-import { isPersonPrompt, parseList } from '../lib/classify.mjs'
+import { SUBMIT_STEPS, isPersonPrompt, parseList } from '../lib/classify.mjs'
 import { canImport, projectsRoot } from '../lib/coldstart.mjs'
 import type { EtaView } from '../types'
 import { registerBand } from './band'
@@ -100,7 +100,7 @@ async function refreshOnce($: Engine, gen: number) {
   let view: EtaView
   if (live && live.isWorking) {
     const est = estimateRun(profile, live)
-    if (live.mainSteps <= 2) rec.setEstimate(live.runId, storedEta(est, live.mainSteps))
+    if (live.mainSteps <= SUBMIT_STEPS) rec.setEstimate(live.runId, storedEta(est, live.mainSteps))
     if (est.leftMs !== null && est.leftSlowMs !== null && checkpointed.get(live.runId) !== live.mainSteps) {
       checkpointed.set(live.runId, live.mainSteps)
       rec.checkpoint(live.runId, { atMs: live.agentMs, usualMs: live.agentMs + est.leftMs, slowMs: live.agentMs + est.leftSlowMs })

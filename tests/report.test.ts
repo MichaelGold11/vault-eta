@@ -15,6 +15,9 @@ type Over = Record<string, unknown>
 
 function row(runId: string, start: number, seconds: number, task: Over = {}, over: Over = {}) {
   const ms = seconds * 1000
+  // a typed run is named by its slash command, so its task type is known at submit, as the replay requires
+  const type = typeof task.taskType === 'string' ? task.taskType : 'wrap'
+  const command = type === 'freeform' ? null : type
   return {
     v: 1,
     kind: 'turn',
@@ -42,7 +45,7 @@ function row(runId: string, start: number, seconds: number, task: Over = {}, ove
     usd: 1,
     steps: [],
     tools: [],
-    task: { taskType: 'wrap', skill: null, command: null, project: 'website', job: null, promptChars: 100, origin: 'composer', runStart: start, ...task },
+    task: { taskType: 'wrap', skill: null, command, project: 'website', job: null, promptChars: 100, origin: 'composer', runStart: start, ...task },
     ...over,
   }
 }
@@ -120,6 +123,16 @@ describe('the report', () => {
     has('| worker-sonnet (sonnet) | 1 | 20s | $0.500 |')
   })
 
+  test('who did the work uses the run clock: a backfilled row\'s long quiet stretch is cut, as in the totals', () => {
+    // a backfilled main row stores its whole 25 min window, but nothing ran from 10 s to 20 min: 10 s + 5 min of work
+    const steps = [{ at: 0, ms: 10_000 }, { at: 1_200_000, ms: 300_000 }]
+    const imported = row('i1', T0 - HOUR, 1500, {}, { src: 'backfill', steps })
+    const t = buildReport([imported], { now: T0 })
+    expect(t).toContain('| All time | 1 | 5m 10s |')
+    expect(t).toContain('| main thread (opus) | 1 | 5m 10s |')
+    expect(t).toContain('Time is each loop\'s own working time on the run clock')
+  })
+
   test('where the time went, and the tool heads by total time', () => {
     expect(text).toContain('| Waiting on you |')
     expect(text).toContain('| Machine asleep |')
@@ -157,6 +170,18 @@ describe('the report', () => {
     expect(text.split('\n').filter(l => l.startsWith('| freeform | ')).length).toBe(1)
   })
 
+  test('wording: a guarded live cell says the run count once, slow is beaten the right way round, and Share names its whole', () => {
+    // 11 wrap runs carrying the estimate they showed: under 30, so no rate, and no "of 11" after it
+    const shown = Array.from({ length: 11 }, (_, i) => row(`s${i}`, T0 - 5 * DAY + i * HOUR, 100, {}, { eta: { usualMs: 90_000, slowMs: 110_000 } }))
+    const t = buildReport(shown, { now: T0 })
+    expect(t).toContain('| too few to say (11 runs shown) |')
+    expect(t).not.toMatch(/too few to say of \d+/)
+    expect(buildReport(shown.slice(0, 1), { now: T0 })).not.toContain('1 runs shown')
+    expect(t).toContain('8 runs in 10 finish under the slow figure')
+    expect(t).not.toContain('is beaten by')
+    expect(t).toContain('Share is of the run time plus the waiting on you and the machine asleep.')
+  })
+
   test('no em dash, no prompt text, four lines on how to read it', () => {
     expect(text.includes(String.fromCharCode(0x2014))).toBe(false)
     const tail = text.split('## How to read this')[1]?.trim().split('\n') ?? []
@@ -167,7 +192,7 @@ describe('the report', () => {
     const lines = text.split('\n')
     // six wrap runs can be compared (the other seven fixture runs have too little behind them): all four predictors are listed in both tables
     expect(text).toContain("In sample, not the verdict's basis: the same 6 runs, each predicted from only the runs that ended before it started.")
-    expect(text).toContain("Held out, the verdict's basis: the last 30% of the runs by start time (2 runs), each slow figure as it stands:")
+    expect(text).toContain("Held out, the verdict's basis: the last 30% of the compared runs by start time (2 runs), each slow figure as it stands:")
     expect(text).toContain('| Predictor | Finished under slow | Median slow | Mean interval score |')
     for (const label of ['Matcher (uncorrected)', 'Matcher (corrected)', 'Per-type median and p80', 'Global median and p80']) {
       expect(lines.filter(l => l.startsWith(`| ${label} | `)).length).toBe(2)
@@ -222,6 +247,28 @@ describe('the report', () => {
     expect(lines.some(l => l.startsWith(`| main model | ${OPUS} | `))).toBe(true)
     // thirteen runs: no month or model is big enough to compare
     expect(text).toContain('Unclear: fewer than two months or models have 30 scored runs to compare.')
+  })
+
+  test('accuracy is at submit, by the task type known then; the figure once the labels are known is a row of its own', () => {
+    // freeform runs of 60 s, and wrap runs of 600 s that load the skill in their third request: at submit all are freeform
+    const steps = [0, 1000, 2000, 3000].map(at => ({ at, ms: 500, stop: 'tool_use' }))
+    const rows = Array.from({ length: 60 }, (_, i) =>
+      i % 2 === 0
+        ? row(`f${i}`, T0 - 60 * HOUR + i * HOUR, 60, { taskType: 'freeform', project: null }, { steps })
+        : row(`w${i}`, T0 - 60 * HOUR + i * HOUR, 600, { command: null }, { steps, tools: [{ at: 2500, name: 'Skill', skill: 'wrap', ms: 5 }] }),
+    )
+    const lines = buildReport(rows, { now: T0 }).split('\n')
+    expect(lines).toContain('| Task type at submit | Scored runs | Finished under slow (target 80%) | Typical miss | Correction in use | As shown live |')
+    // one row: every run is freeform at submit, matched against the runs that stayed freeform; from the tenth run on
+    // there are five of those behind it, and the 26 wrap runs among the 51 scored blow through their figure
+    const accuracy = lines.slice(lines.indexOf('## Accuracy per task type'), lines.indexOf('## Versus naive baselines'))
+    expect(accuracy.filter(l => l.startsWith('| freeform | 51 | 49% ')).length).toBe(1)
+    expect(accuracy.some(l => l.startsWith('| wrap | '))).toBe(false)
+    const hit = (label: string) => Number(/\| (\d+)% \(/.exec(accuracy.find(l => l.startsWith(`| ${label} | `)) ?? '')?.[1] ?? NaN)
+    expect(hit('At submit (the labels known then)')).toBe(49)
+    // with each run's own label, wrap is matched to wrap: every run holds
+    expect(hit("Once the labels are known (each run's own task type and project)")).toBe(100)
+    expect(accuracy.some(l => l.startsWith('The second row is better informed than any estimate at submit'))).toBe(true)
   })
 
   test('the cost table scores the same replay on dollars', () => {

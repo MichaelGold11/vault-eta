@@ -9,11 +9,17 @@
 // only runs that had none, no shape key. "matching" is the lib's matching as
 // it is now (project and shape only when known) with legacy labels, and
 // "current" adds the generic helper skills. Each is scored in the states an
-// estimate really has:
+// estimate really has, and one it never has:
 //
-//   final   the run's own labels known (the report's accuracy table)
+//   final   the run's own labels known, which only the finished run has, so
+//           no estimate at submit does (the report's and scorecard's "once the
+//           labels are known" figure)
 //   submit  only what the first estimate has: the slash command, prompt size,
 //           model and effort (no skill, no folder, no shape yet)
+//   kept    the estimate kept as the run's estimate at submit, refreshed
+//           through its first two requests: the skills loaded and folders
+//           touched in them, no shape (the report's and scorecard's figure
+//           at submit, which read the label each live run kept)
 //   steps k after k model requests: the skills loaded so far, the folders
 //           touched so far and, from the third request, the shape; the matches
 //           still going give the time left (history part of the estimate only)
@@ -37,7 +43,7 @@
 
 import path from 'node:path'
 import { agentMsBefore, earlyByRun, summarizeRuns } from '../lib/aggregate.mjs'
-import { EDIT_TOOLS, SHAPE_STEPS, classifyRun, parseList, shapeOf } from '../lib/classify.mjs'
+import { EDIT_TOOLS, SHAPE_STEPS, SUBMIT_STEPS, classifyRun, parseList, shapeOf } from '../lib/classify.mjs'
 import { modelKey } from '../lib/price.mjs'
 import { LEVELS, replay, replayAgentsAtStep, replayAtStep, scoreSteps, typicalError, wilson, withAgents } from '../lib/stats.mjs'
 import { loadAllRows } from './report.mjs'
@@ -116,10 +122,18 @@ function replayRuns(usable, early, setup) {
     return bare && !setup.ignore.includes(bare.toLowerCase()) ? bare : null
   }
   const out = {}
-  out.final = replay(runs, { levels })
+  out.final = replay(runs, { levels, labels: 'final' })
   out.submit = replay(runs, {
     levels,
     queryOf: r => query(r, { taskType: commandOf(r.runId) ?? 'freeform', project: null, model: r.model === NONE ? null : r.model, effort: r.effort, promptChars: r.promptChars }),
+  })
+  out.kept = replay(runs, {
+    levels,
+    queryOf: r => {
+      const e = early.get(r.runId)
+      const l = e ? labelOf(e.facts, e.command, setup, SUBMIT_STEPS) : { taskType: commandOf(r.runId) ?? 'freeform', project: null }
+      return query(r, { taskType: l.taskType, project: l.project, model: r.model === NONE ? null : r.model, effort: r.effort, promptChars: r.promptChars })
+    },
   })
   out.steps = {}
   out.agentSteps = {}
@@ -162,7 +176,12 @@ export function evaluate(rows, options) {
     const rowsOf = k ? r.out.steps[k] : r.out[state]
     return { rows: rowsOf, field: k ? 'step' : 'submit' }
   }
-  const states = [['final', 'final labels', null], ['submit', 'at submit', null], ...options.steps.map(k => [`steps`, `after ${k} requests`, k])]
+  const states = [
+    ['final', 'final labels (known only after the run)', null],
+    ['submit', 'at submit, first estimate', null],
+    ['kept', `at submit, as kept (labels of the first ${SUBMIT_STEPS} requests)`, null],
+    ...options.steps.map(k => [`steps`, `after ${k} requests`, k]),
+  ]
   for (const [state, title, k] of states) {
     for (const [set, test] of [['freeform', r => r.taskType === 'freeform'], ['all runs', () => true]]) {
       const cells = names.map(name => {
@@ -180,7 +199,7 @@ export function evaluate(rows, options) {
   // by shape (the run's own, as the report has it), for the current setup
   const shapeOf_ = new Map(usable.map(r => [r.runId, r.shape ?? 'answer']))
   const keyOf = (/** @type {{ runId: string }} */ r) => shapeOf_.get(r.runId) ?? 'answer'
-  const states_ = [['submit', results.current.out.submit, 'submit'], ...options.steps.map(k => [`step ${k}`, results.current.out.steps[k], 'step'])]
+  const states_ = [['submit, first estimate', results.current.out.submit, 'submit'], ['submit, as kept', results.current.out.kept, 'submit'], ...options.steps.map(k => [`step ${k}`, results.current.out.steps[k], 'step'])]
   const byState = states_.map(([title, rowsOf, field]) => [title, scoreSteps(rowsOf, keyOf, field)])
   const shapes = ['answer', 'read', 'shell', 'edit', 'agents']
   const shapeCell = g => {

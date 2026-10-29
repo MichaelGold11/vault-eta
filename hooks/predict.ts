@@ -68,6 +68,8 @@ function toRun(s: ReturnType<typeof summarizeRuns>[number]): ProfileRun {
     unpricedTurns: s.unpricedTurns,
     taskType: s.taskType,
     project: s.project,
+    submitTaskType: s.submitTaskType,
+    submitProject: s.submitProject,
     model: modelKey(s.model),
     effort: s.effort,
     promptChars: s.promptChars,
@@ -203,8 +205,11 @@ export class Profile {
    * Per task type: how often the slow figure held, its correction, and which
    * estimate missed by less. Scored by replaying every run against only the
    * runs that ended before it (uncorrected), so there is data from day one;
-   * what live runs actually showed is scored apart (`shown`). Computed at
-   * load, then again by refreshScores while idle.
+   * what live runs actually showed is scored apart (`shown`). Each run is
+   * replayed with the labels known at submit and scored under the task type
+   * known then, the key estimateRun looks the correction up by, so the
+   * correction is fitted to the estimate it corrects. Computed at load, then
+   * again by refreshScores while idle.
    */
   score(): Record<string, TypeScore> {
     if (this.scores) return this.scores

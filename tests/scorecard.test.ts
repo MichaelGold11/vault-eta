@@ -42,7 +42,8 @@ function row(i: number, over: Over = {}) {
     usd: 0.5 + (i % 5) / 10,
     steps: [],
     tools: [{ at: 0, name: 'Bash', cmd: 'deploy-prod secret-host', ms: 1000 }],
-    task: { taskType: i % 2 === 0 ? 'alphasite-launch-plan' : 'deltalog-notes', skill: 'epsilonhealth-skill', command: null, project: i % 3 === 0 ? 'betashop' : 'gammaapp', job: 'acme-secret', promptChars: 100, origin: 'composer', runStart: start, cwd: '/Users/sam/code/acme-secret' },
+    // named by its slash command, so the task type is known at submit, as the replay requires
+    task: { taskType: i % 2 === 0 ? 'alphasite-launch-plan' : 'deltalog-notes', skill: 'epsilonhealth-skill', command: i % 2 === 0 ? 'alphasite-launch-plan' : 'deltalog-notes', project: i % 3 === 0 ? 'betashop' : 'gammaapp', job: 'acme-secret', promptChars: 100, origin: 'composer', runStart: start, cwd: '/Users/sam/code/acme-secret' },
     ...over,
   }
 }
@@ -53,15 +54,40 @@ describe('the scorecard', () => {
   test('has the numbers: runs and days, the shape table, cost, the verdict line and drift', () => {
     const text = buildScorecard(rows)
     expect(text.startsWith(`${SCORECARD_MARK}\n`)).toBe(true)
-    expect(text).toMatch(/80 runs over 41 days \(41 with runs\); 80 finished and scored\./)
+    expect(text).toMatch(/80 runs over 41 days \(41 with runs\); 80 finished, \d+ scored \(/)
     expect(text).toContain('| Shape | Scored runs | Finished under slow | Typical miss |')
     expect(text).toMatch(/\| all runs \| \d+ \| /)
+    // the table is at submit; the figure with each run's own labels is a line of its own, marked as such
+    expect(text).toContain("the typical miss of the usual figure, at submit: each estimate knows only the task type and project the run's estimate at submit had")
+    expect(text).toMatch(/Once the labels are known \(each run's own task type and project, which only the finished run has, so no estimate at submit does\): \d+ scored runs, finished under slow \d+% \(\d+% to \d+%\), typical miss x\d\.\d\./)
     expect(text).toContain('## Cost estimate')
     expect(text).toMatch(/\*\*(yes|no|unclear)\*\* \(/)
     // the verdict is by interval score, on time and on cost, with both scores and the resample rate
     expect(text).toMatch(/on time, out of sample, by interval score\? \*\*(yes|no|unclear)\*\* \(mean interval score \d+m \d+s against \d+m \d+s, \d+\.\d% (lower|higher), lower in \d+% of 500 resamples; \d+ runs held out\)\./)
     expect(text).toMatch(/on cost, out of sample, by interval score\? \*\*(yes|no|unclear)\*\* \(mean interval score \$[\d.]+ against \$[\d.]+, /)
-    expect(text).toMatch(/Has the slow figure's hit rate shifted between months or between models\? \*\*(yes|no|unclear)\*\*/)
+    expect(text).toMatch(/Has the slow figure's hit rate shifted between months or between models\? \*\*(yes|no|too few runs to say)\*\*/)
+  })
+
+  test('drift never prints a bare answer: it says too few runs under 30 per group, and states the rule otherwise', () => {
+    const few = buildScorecard(rows.slice(0, 12))
+    expect(few).toContain('**too few runs to say** (fewer than two months or two models have 30 scored runs to compare).')
+    expect(few).not.toMatch(/\*\*(no|yes)\*\*\.$/m)
+    // one month, 140 runs on two models that hit the same: two big groups, intervals overlap
+    const many = Array.from({ length: 140 }, (_, i) => row(i, { start: T0 + i * 60_000, end: T0 + i * 60_000 + 60_000 }))
+    const text = buildScorecard(many)
+    expect(text).toMatch(/\*\*no\*\* \(no two groups of at least 30 runs have coverage intervals that are apart\)\./)
+  })
+
+  test('the first line counts finished and scored apart: scored is what the table scores, the rest are still learning', () => {
+    const three = buildScorecard(rows.slice(0, 3))
+    expect(three).toContain('3 finished, 0 scored (a run is scored only when enough earlier runs exist to predict it).')
+    expect(three).not.toContain('finished and scored')
+  })
+
+  test('the day span is counted in calendar days, so it never falls below the days with runs', () => {
+    const at = (i: number, d: number, h: number) => row(i, { start: new Date(2026, 9, d, h, 0, 0).getTime(), end: new Date(2026, 9, d, h, 1, 0).getTime() })
+    const text = buildScorecard([at(0, 5, 23), at(1, 6, 12), at(2, 7, 1)])
+    expect(text).toContain('3 runs over 3 days (3 with runs)')
   })
 
   test('a coverage rate carries its Wilson interval; under 30 scored runs it says too few to say', () => {

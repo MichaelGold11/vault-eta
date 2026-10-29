@@ -308,6 +308,78 @@ describe('replaying the history', () => {
     expect(replayAtStep(runs, { stateOf: () => null })).toEqual([])
   })
 
+  test('at submit the replay knows only the labels known then; the run\'s own labels only when asked', () => {
+    // wrap runs: those that end up editing in the website folder take ten times longer, and only show it once they do,
+    // so every run's project at submit is none. Twelve website runs and twelve without, alternating.
+    const runs = Array.from({ length: 24 }, (_, i) => {
+      const website = i % 2 === 1
+      return { ...timed(`p${i}`, i * 3_600_000, website ? 600 : 60, { project: website ? 'website' : null }), submitTaskType: 'wrap', submitProject: null }
+    })
+    const probe = (options?: Parameters<typeof replay>[1]) => replay(runs, options).find(r => r.runId === 'p23')
+    // at submit (the default): no project, so the type-wide figure, the website runs and the others together
+    const atSubmit = probe()
+    expect(atSubmit?.level).toBe('type+model')
+    expect(atSubmit?.n).toBe(23)
+    expect(atSubmit?.submit?.usualMs).toBe(60_000)
+    expect(atSubmit).toEqual(probe({ queryOf: r => ({ ...r, project: null, shape: undefined }) }))
+    // with the labels known (the run's own, final ones): the website runs alone, which a run cannot know at submit
+    const known = probe({ labels: 'final' })
+    expect(known?.level).toBe('type+project+model')
+    expect(known?.submit?.usualMs).toBe(600_000)
+    expect(known).toEqual(probe({ queryOf: r => ({ ...r, shape: undefined }) }))
+  })
+
+  test('at submit a run is matched under the task type known then, and scored under it', () => {
+    // freeform runs of 60 s, and runs that load the wrap skill only after their second request (600 s):
+    // at submit both are freeform, so the wrap runs are matched against freeform history
+    const runs = Array.from({ length: 30 }, (_, i) => {
+      const wrap = i % 3 === 2
+      return { ...timed(`t${i}`, i * 3_600_000, wrap ? 600 : 60, { taskType: wrap ? 'wrap' : 'freeform' }), submitTaskType: 'freeform', submitProject: null }
+    })
+    const late = replay(runs).find(r => r.runId === 't29')
+    expect(late).toMatchObject({ taskType: 'wrap', queryType: 'freeform', n: 20 })
+    expect(late?.submit?.usualMs).toBe(60_000)
+    // the self-score (and its correction, which live looks up by the task type it knows) is keyed the same way
+    const scores = scoreRuns(runs)
+    expect(Object.keys(scores)).toEqual(['freeform'])
+    // runs 7 to 29 have five freeform runs behind them; the wrap runs among them miss the freeform figure
+    expect(scores.freeform?.n).toBe(23)
+    expect(near(scores.freeform?.coverage, 15 / 23)).toBe(true)
+    // what the live runs showed is scored under the same key: the ten wrap runs kept an estimate made as freeform
+    const shownRuns = runs.map(r => (r.taskType === 'wrap' ? { ...r, eta: { usualMs: 60_000, slowMs: 60_000 } } : r))
+    expect(scoreRuns(shownRuns).freeform?.shown).toEqual({ n: 10, coverage: 0 })
+    // once the labels are known, each type is matched and scored on its own
+    const final = scoreRuns(runs, { labels: 'final' })
+    expect(Object.keys(final).sort()).toEqual(['freeform', 'wrap'])
+    expect(scoreRuns(shownRuns, { labels: 'final' }).wrap?.shown).toEqual({ n: 10, coverage: 0 })
+    expect(replay(runs, { labels: 'final' }).find(r => r.runId === 't29')).toMatchObject({ taskType: 'wrap', queryType: 'wrap', n: 9 })
+  })
+
+  test('the correction fitted at submit holds at submit: final labels would fit one that under-covers live', () => {
+    // the reviewer's case: 400 runs of one type, 40% end up in the website folder and take ten times longer;
+    // live, the project is unknown at submit for every one of them
+    let seed = 99
+    const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647
+    const normal = () => Math.sqrt(-2 * Math.log(rnd())) * Math.cos(2 * Math.PI * rnd())
+    const runs = Array.from({ length: 400 }, (_, i) => {
+      const website = rnd() < 0.4
+      const ms = Math.round(Math.exp(0.4 * normal()) * (website ? 600_000 : 60_000))
+      return { ...timed(`w${i}`, i * 3_600_000, ms / 1000, { project: website ? 'website' : null }), submitTaskType: 'wrap', submitProject: null }
+    })
+    // what live has at submit: the slow figure from the project-less query, times the correction it fitted
+    const liveCoverage = (factor: number) => {
+      const rows = replay(runs, { queryOf: r => ({ ...r, project: null, shape: undefined }) }).flatMap(r => (r.submit ? [r] : []))
+      return rows.filter(r => r.actualMs <= Math.max(r.submit?.usualMs ?? 0, (r.submit?.slowMs ?? 0) * factor)).length / rows.length
+    }
+    const fitted = scoreRuns(runs).wrap?.factor ?? 1
+    const leaky = scoreRuns(runs, { labels: 'final' }).wrap?.factor ?? 1
+    // the correction fitted at submit lands within sampling noise of the 80% target live
+    expect(Math.abs(liveCoverage(fitted) - 0.8) < 0.03).toBe(true)
+    // the one fitted with each run's final project shrinks the slow figure and leaves live well short
+    expect(leaky < 0.75).toBe(true)
+    expect(liveCoverage(leaky) < 0.7).toBe(true)
+  })
+
   test('1,500 runs replay well under 300 ms', () => {
     const types = ['wrap', 'ship', 'design', 'memory', 'freeform']
     const runs = Array.from({ length: 1500 }, (_, i) => {

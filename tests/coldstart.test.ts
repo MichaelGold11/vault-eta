@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { canImport, findTranscripts, importHistory, projectsRoot } from '../lib/coldstart.mjs'
+import { canImport, findTranscripts, fsDisk, importHistory, projectsRoot, transcriptIo } from '../lib/coldstart.mjs'
 import { main, meta, sub } from './fixtures/backfill'
 
 // /eta backfill's import over a file system in memory: the transcripts under
@@ -112,6 +112,8 @@ describe('cold start: /eta backfill', () => {
   test('a transcript too big for $.fs is skipped and said so; no transcripts is said too', async () => {
     const { fs } = memory({ tooBig: [`${DIR}/sess1.jsonl`] })
     expect(await importHistory(fs, opts)).toMatch(/^imported 0 runs; 1 transcript skipped/)
+    // the toast does not claim every failure was a size: it says over 4 MiB, or unreadable
+    expect(await importHistory(fs, opts)).toContain('not read here: over 4 MiB, or unreadable')
     expect(await importHistory(fs, { ...opts, vault: '/nowhere' })).toBe('no Claude Code transcripts found for this folder')
   })
 
@@ -142,5 +144,73 @@ describe('cold start: /eta backfill', () => {
   test('a machine id that is not a folder name is refused', async () => {
     const { fs } = memory()
     await expect(importHistory(fs, { ...opts, machine: '../x' })).rejects.toThrow('this machine has no id yet')
+  })
+})
+
+describe('cold start: transcriptIo', () => {
+  test('lists the main files, the subagent files of a session, their meta, and gives the lines of a file', async () => {
+    const { fs } = memory()
+    const found = await findTranscripts(fs, '/v', ROOT)
+    if (!found) throw new Error('no transcripts')
+    const { io, state } = await transcriptIo(fs, found, `${RUNS}/..`)
+    expect(io.mainFiles()).toEqual(['sess1.jsonl'])
+    expect(io.subFiles('sess1')).toEqual(['agent-abc123.jsonl'])
+    expect(io.subFiles('nobody')).toEqual([])
+    expect(io.meta('sess1/subagents/agent-abc123.meta.json')).toEqual(meta['sess1/subagents/agent-abc123.meta.json'])
+    expect(io.meta('sess1/subagents/none.meta.json')).toBe(null)
+    const lines: string[] = []
+    for await (const l of io.lines('sess1.jsonl')) lines.push(l)
+    expect(lines).toEqual(main['sess1.jsonl'])
+    expect(state.tooBig).toBe(0)
+  })
+
+  test('the run ids of the live log are known, a backfill file is not; a file that cannot be read is counted once per read and gives no lines', async () => {
+    const live = JSON.stringify({ kind: 'turn', runId: 'live1' }) + '\n' + JSON.stringify({ kind: 'session', runId: 'nope' }) + '\ntorn{\n'
+    const { fs } = memory({ files: { [`${RUNS}/2026-10-10-s1.jsonl`]: live, [`${RUNS}/backfill-2026-09.jsonl`]: JSON.stringify({ kind: 'turn', runId: 'old' }) + '\n' }, tooBig: [`${DIR}/sess1.jsonl`] })
+    const found = await findTranscripts(fs, '/v', ROOT)
+    if (!found) throw new Error('no transcripts')
+    const { io, state } = await transcriptIo(fs, found, '/v/.vault-eta/runs')
+    expect([...io.liveRunIds()]).toEqual(['live1'])
+    for (const _ of [1, 2]) for await (const _l of io.lines('sess1.jsonl')) throw new Error('lines from an unreadable file')
+    expect(state.tooBig).toBe(2)
+  })
+})
+
+describe('cold start: fsDisk', () => {
+  test('lstat tells a file, a folder and a link apart and is null for nothing; list gives names', async () => {
+    const { fs } = memory({ links: { '/v/link': '/out' } })
+    const disk = fsDisk(fs)
+    expect(await disk.lstat(`${DIR}/sess1.jsonl`)).toEqual({ isLink: false, kind: 'file' })
+    expect(await disk.lstat(DIR)).toEqual({ isLink: false, kind: 'dir' })
+    expect(await disk.lstat('/v/link')).toEqual({ isLink: true, kind: 'other' })
+    expect(await disk.lstat('/v/missing')).toBe(null)
+    expect(await disk.list(DIR)).toContain('sess1.jsonl')
+    expect(await disk.realPath(`${DIR}/sess1.jsonl`)).toBe(`${DIR}/sess1.jsonl`)
+    expect(await disk.realPath('/v/missing')).toBe(null)
+  })
+
+  test('a link that leads nowhere and cannot be stat-ed is still found by its folder\'s listing', async () => {
+    const stub = {
+      stat: async () => {
+        throw new Error('ENOENT')
+      },
+      list: async (dir: string) => (dir === '/v' ? [{ name: 'dangling', kind: 'other', isLink: true }, { name: 'plain', kind: 'file', isLink: false }] : []),
+      read: async () => '',
+      write: async () => {},
+    }
+    const disk = fsDisk(stub as never)
+    expect(await disk.lstat('/v/dangling')).toEqual({ isLink: true, kind: 'other' })
+    expect(await disk.lstat('/v/plain')).toBe(null)
+    expect(await disk.lstat('nodir')).toBe(null)
+  })
+
+  test('write writes the file; remove empties it, since $.fs cannot delete; mkdir does nothing', async () => {
+    const { mem, fs } = memory()
+    const disk = fsDisk(fs)
+    await disk.write('/v/a.txt', 'hello')
+    expect(mem.files.get('/v/a.txt')).toBe('hello')
+    await disk.remove('/v/a.txt')
+    expect(mem.files.get('/v/a.txt')).toBe('')
+    expect(disk.mkdir()).toBe(undefined)
   })
 })
